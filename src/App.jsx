@@ -925,6 +925,7 @@ function App() {
       nextPath: null,
       nextFileSystem: null,
       nextNanoSession: undefined,
+      clearHistory: false,
     }
 
     if (commandParts.length === 0) return result
@@ -1121,6 +1122,11 @@ function App() {
       return result
     }
 
+    if (command === 'clear') {
+      result.clearHistory = true
+      return result
+    }
+
     if (command === 'pwd') {
       result.lines.push({
         type: 'output',
@@ -1132,7 +1138,7 @@ function App() {
     if (command === 'help') {
       result.lines.push({
         type: 'output',
-        text: 'Comandos: ls, cd, cat, mkdir, nano, pwd, help',
+        text: 'Comandos: ls, cd, cat, mkdir, nano, clear, pwd, help',
       })
       return result
     }
@@ -1148,15 +1154,6 @@ function App() {
     const executionPath = currentPath
     const executionFileSystem = fileSystem
 
-    setHistory((previous) => [
-      ...previous,
-      {
-        type: 'command',
-        path: executionPath,
-        text: typedCommand,
-      },
-    ])
-
     if (typedCommand.trim()) {
       setCommandHistory((previous) => [...previous, typedCommand])
     }
@@ -1171,7 +1168,19 @@ function App() {
       executionFileSystem
     )
 
-    appendHistoryLines(executionResult.lines)
+    if (executionResult.clearHistory) {
+      setHistory([])
+    } else {
+      setHistory((previous) => [
+        ...previous,
+        {
+          type: 'command',
+          path: executionPath,
+          text: typedCommand,
+        },
+        ...executionResult.lines,
+      ])
+    }
 
     if (executionResult.nextPath !== null) {
       setCurrentPath(executionResult.nextPath)
