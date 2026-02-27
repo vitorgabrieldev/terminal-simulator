@@ -1,0 +1,33 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+:root {
+  --font-terminal: 'JetBrains Mono', 'Fira Code', 'Cascadia Mono', 'SF Mono',
+    Consolas, 'Liberation Mono', monospace;
+
+  font-family: var(--font-terminal);
+  font-weight: 400;
+  line-height: 1.5;
+  color: #d8e5f2;
+  background-color: #03070c;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  min-height: 100%;
+}
+
+body {
+  min-width: 320px;
+  background: #03070c;
+}
