@@ -2,9 +2,87 @@ import { useEffect, useRef, useState } from 'react'
 import './App.css'
 
 const STORAGE_KEY = 'terminal_simulator_linux_fs_v1'
+const STORAGE_PACKAGES_KEY = 'terminal_simulator_packages_v1'
+const STORAGE_BOOT_KEY = 'terminal_simulator_boot_ts_v1'
 const USERNAME = 'dev'
 const HOSTNAME = 'ubuntu'
 const HOME_PATH = `/home/${USERNAME}`
+
+const COMMAND_PATHS = {
+  ls: '/bin/ls',
+  cd: '/bin/cd',
+  pwd: '/bin/pwd',
+  mkdir: '/bin/mkdir',
+  rmdir: '/bin/rmdir',
+  rm: '/bin/rm',
+  cp: '/bin/cp',
+  mv: '/bin/mv',
+  touch: '/bin/touch',
+  stat: '/usr/bin/stat',
+  cat: '/bin/cat',
+  less: '/usr/bin/less',
+  more: '/bin/more',
+  head: '/usr/bin/head',
+  tail: '/usr/bin/tail',
+  find: '/usr/bin/find',
+  locate: '/usr/bin/locate',
+  grep: '/bin/grep',
+  which: '/usr/bin/which',
+  whereis: '/usr/bin/whereis',
+  chmod: '/bin/chmod',
+  chown: '/bin/chown',
+  chgrp: '/bin/chgrp',
+  apt: '/usr/bin/apt',
+  uname: '/bin/uname',
+  hostname: '/bin/hostname',
+  uptime: '/usr/bin/uptime',
+  date: '/bin/date',
+  cal: '/usr/bin/cal',
+  ps: '/bin/ps',
+  top: '/usr/bin/top',
+  htop: '/usr/bin/htop',
+  kill: '/bin/kill',
+  pkill: '/usr/bin/pkill',
+  ping: '/bin/ping',
+  ifconfig: '/sbin/ifconfig',
+  ip: '/sbin/ip',
+  netstat: '/bin/netstat',
+  curl: '/usr/bin/curl',
+  wget: '/usr/bin/wget',
+  tar: '/bin/tar',
+  gzip: '/bin/gzip',
+  gunzip: '/bin/gunzip',
+  zip: '/usr/bin/zip',
+  unzip: '/usr/bin/unzip',
+  man: '/usr/bin/man',
+  info: '/usr/bin/info',
+  nano: '/bin/nano',
+  clear: '/usr/bin/clear',
+  help: '/usr/bin/help',
+}
+
+const AVAILABLE_PACKAGES = [
+  { name: 'curl', version: '8.5.0', description: 'transfer data from or to a server' },
+  { name: 'wget', version: '1.21.4', description: 'non-interactive network downloader' },
+  { name: 'htop', version: '3.2.2', description: 'interactive process viewer' },
+  { name: 'net-tools', version: '2.10', description: 'ifconfig, netstat and tools' },
+  { name: 'zip', version: '3.0', description: 'compress and archive utility' },
+  { name: 'unzip', version: '6.0', description: 'extract zip archives' },
+  { name: 'less', version: '590', description: 'file pager' },
+  { name: 'nano', version: '8.0', description: 'text editor' },
+]
+
+const DEFAULT_INSTALLED_PACKAGES = [
+  'base-files',
+  'bash',
+  'coreutils',
+  'grep',
+  'sed',
+  'nano',
+  'less',
+  'tar',
+  'gzip',
+]
 
 const NANO_VIEWPORT_LINES = 20
 const NANO_SHORTCUT_ROWS = [
@@ -222,7 +300,8 @@ function createDirectoryAtPath(fileSystem, path) {
     return { error: `mkdir: cannot create directory '${path}': File exists` }
   }
 
-  currentNode.children[name] = dir({})
+  currentNode.children[name] = ensureNodeMetadata(dir({}), path)
+  currentNode.children[name].mtime = new Date().toISOString()
   return { root: cloned }
 }
 
@@ -253,7 +332,359 @@ function writeFileAtPath(fileSystem, path, content) {
   }
 
   currentNode.children[fileName] = file(content)
+  const writtenPath = path === '/' ? `/${fileName}` : path
+  currentNode.children[fileName] = ensureNodeMetadata(
+    { ...currentNode.children[fileName], content },
+    writtenPath
+  )
+  currentNode.children[fileName].mtime = new Date().toISOString()
   return { root: cloned, created: !existingNode }
+}
+
+function resolveParentNode(root, path) {
+  const segments = splitPath(path)
+  if (segments.length === 0) {
+    return { error: 'Operation not permitted on root path' }
+  }
+
+  let parent = root
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    const segment = segments[index]
+    const child = parent.children[segment]
+    if (!child) {
+      return { error: 'No such file or directory' }
+    }
+    if (child.type !== 'dir') {
+      return { error: 'Not a directory' }
+    }
+    parent = child
+  }
+
+  return { parent, name: segments[segments.length - 1] }
+}
+
+function deepCloneNode(node, path) {
+  if (node.type === 'file') {
+    return ensureNodeMetadata({ ...node, content: node.content ?? '' }, path)
+  }
+
+  const children = {}
+  for (const [name, child] of Object.entries(node.children || {})) {
+    const childPath = path === '/' ? `/${name}` : `${path}/${name}`
+    children[name] = deepCloneNode(child, childPath)
+  }
+  return ensureNodeMetadata({ ...node, children }, path)
+}
+
+function touchPath(fileSystem, path) {
+  const cloned = cloneFileSystem(fileSystem)
+  const parentInfo = resolveParentNode(cloned, path)
+  if (parentInfo.error) {
+    return { error: `touch: cannot touch '${path}': ${parentInfo.error}` }
+  }
+
+  const { parent, name } = parentInfo
+  const existing = parent.children[name]
+  const now = new Date().toISOString()
+
+  if (existing) {
+    if (existing.type !== 'file') {
+      return { error: `touch: cannot touch '${path}': Is a directory` }
+    }
+    parent.children[name] = { ...existing, mtime: now }
+    return { root: cloned, created: false }
+  }
+
+  const fullPath = path
+  parent.children[name] = ensureNodeMetadata(file(''), fullPath)
+  parent.children[name].mtime = now
+  return { root: cloned, created: true }
+}
+
+function removePath(fileSystem, path, recursive = false) {
+  const cloned = cloneFileSystem(fileSystem)
+  const parentInfo = resolveParentNode(cloned, path)
+  if (parentInfo.error) {
+    return { error: `rm: cannot remove '${path}': ${parentInfo.error}` }
+  }
+
+  const { parent, name } = parentInfo
+  const target = parent.children[name]
+  if (!target) {
+    return { error: `rm: cannot remove '${path}': No such file or directory` }
+  }
+
+  if (target.type === 'dir' && !recursive) {
+    return { error: `rm: cannot remove '${path}': Is a directory` }
+  }
+
+  delete parent.children[name]
+  parent.mtime = new Date().toISOString()
+  return { root: cloned }
+}
+
+function removeDirectoryPath(fileSystem, path) {
+  const cloned = cloneFileSystem(fileSystem)
+  const parentInfo = resolveParentNode(cloned, path)
+  if (parentInfo.error) {
+    return { error: `rmdir: failed to remove '${path}': ${parentInfo.error}` }
+  }
+
+  const { parent, name } = parentInfo
+  const target = parent.children[name]
+  if (!target) {
+    return { error: `rmdir: failed to remove '${path}': No such file or directory` }
+  }
+  if (target.type !== 'dir') {
+    return { error: `rmdir: failed to remove '${path}': Not a directory` }
+  }
+  if (Object.keys(target.children).length > 0) {
+    return { error: `rmdir: failed to remove '${path}': Directory not empty` }
+  }
+
+  delete parent.children[name]
+  parent.mtime = new Date().toISOString()
+  return { root: cloned }
+}
+
+function resolveCopyTargetPath(fileSystem, sourcePath, destinationPath) {
+  const destinationNode = getNodeAtPath(fileSystem, destinationPath)
+  if (destinationNode && destinationNode.type === 'dir') {
+    const baseName = getBaseName(sourcePath)
+    return destinationPath === '/' ? `/${baseName}` : `${destinationPath}/${baseName}`
+  }
+  return destinationPath
+}
+
+function copyPath(fileSystem, sourcePath, destinationPath, recursive = false) {
+  const sourceNode = getNodeAtPath(fileSystem, sourcePath)
+  if (!sourceNode) {
+    return { error: `cp: cannot stat '${sourcePath}': No such file or directory` }
+  }
+  if (sourceNode.type === 'dir' && !recursive) {
+    return { error: `cp: -r not specified; omitting directory '${sourcePath}'` }
+  }
+
+  const cloned = cloneFileSystem(fileSystem)
+  const targetPath = resolveCopyTargetPath(cloned, sourcePath, destinationPath)
+  if (sourcePath === targetPath) {
+    return {
+      error: `cp: '${sourcePath}' and '${destinationPath}' are the same file`,
+    }
+  }
+
+  const parentInfo = resolveParentNode(cloned, targetPath)
+  if (parentInfo.error) {
+    return {
+      error: `cp: cannot create regular file '${destinationPath}': ${parentInfo.error}`,
+    }
+  }
+
+  const { parent, name } = parentInfo
+  const existing = parent.children[name]
+  if (existing && existing.type === 'dir' && sourceNode.type === 'file') {
+    return { error: `cp: cannot overwrite directory '${targetPath}' with non-directory` }
+  }
+  if (existing && existing.type === 'file' && sourceNode.type === 'dir') {
+    return { error: `cp: cannot overwrite non-directory '${targetPath}' with directory` }
+  }
+
+  parent.children[name] = deepCloneNode(sourceNode, targetPath)
+  parent.children[name].mtime = new Date().toISOString()
+  parent.mtime = new Date().toISOString()
+  return { root: cloned }
+}
+
+function movePath(fileSystem, sourcePath, destinationPath) {
+  const sourceNode = getNodeAtPath(fileSystem, sourcePath)
+  if (!sourceNode) {
+    return { error: `mv: cannot stat '${sourcePath}': No such file or directory` }
+  }
+
+  const cloned = cloneFileSystem(fileSystem)
+  const realDestinationPath = resolveCopyTargetPath(cloned, sourcePath, destinationPath)
+  if (sourcePath === realDestinationPath) {
+    return { root: cloned }
+  }
+
+  if (sourceNode.type === 'dir' && realDestinationPath.startsWith(`${sourcePath}/`)) {
+    return {
+      error: `mv: cannot move '${sourcePath}' to a subdirectory of itself, '${realDestinationPath}'`,
+    }
+  }
+
+  const sourceParentInfo = resolveParentNode(cloned, sourcePath)
+  if (sourceParentInfo.error) {
+    return { error: `mv: cannot move '${sourcePath}': ${sourceParentInfo.error}` }
+  }
+  const destinationParentInfo = resolveParentNode(cloned, realDestinationPath)
+  if (destinationParentInfo.error) {
+    return {
+      error: `mv: cannot move '${sourcePath}' to '${destinationPath}': ${destinationParentInfo.error}`,
+    }
+  }
+
+  const movingNode = sourceParentInfo.parent.children[sourceParentInfo.name]
+  if (!movingNode) {
+    return { error: `mv: cannot stat '${sourcePath}': No such file or directory` }
+  }
+
+  destinationParentInfo.parent.children[destinationParentInfo.name] = movingNode
+  destinationParentInfo.parent.children[destinationParentInfo.name].mtime = new Date().toISOString()
+  delete sourceParentInfo.parent.children[sourceParentInfo.name]
+  sourceParentInfo.parent.mtime = new Date().toISOString()
+  destinationParentInfo.parent.mtime = new Date().toISOString()
+  return { root: cloned }
+}
+
+function mutateNodeAtPath(fileSystem, path, mutator, commandName) {
+  const cloned = cloneFileSystem(fileSystem)
+  const parentInfo = resolveParentNode(cloned, path)
+  if (parentInfo.error) {
+    return { error: `${commandName}: cannot access '${path}': ${parentInfo.error}` }
+  }
+
+  const node = parentInfo.parent.children[parentInfo.name]
+  if (!node) {
+    return { error: `${commandName}: cannot access '${path}': No such file or directory` }
+  }
+
+  const nextNode = mutator({ ...node }, path)
+  parentInfo.parent.children[parentInfo.name] = nextNode
+  parentInfo.parent.mtime = new Date().toISOString()
+  return { root: cloned }
+}
+
+function walkFileSystem(node, currentPath, visitor) {
+  visitor(node, currentPath)
+  if (node.type !== 'dir') return
+  const names = Object.keys(node.children).sort((a, b) => a.localeCompare(b))
+  for (const name of names) {
+    const childPath = currentPath === '/' ? `/${name}` : `${currentPath}/${name}`
+    walkFileSystem(node.children[name], childPath, visitor)
+  }
+}
+
+function ensureDirectoryPath(fileSystem, path) {
+  if (path === '/') return { root: fileSystem }
+
+  const cloned = cloneFileSystem(fileSystem)
+  let currentNode = cloned
+  let currentPath = ''
+  for (const segment of splitPath(path)) {
+    currentPath += `/${segment}`
+    if (!currentNode.children[segment]) {
+      currentNode.children[segment] = ensureNodeMetadata(dir({}), currentPath)
+    } else if (currentNode.children[segment].type !== 'dir') {
+      return { error: `Path component '${segment}' is not a directory` }
+    }
+    currentNode = currentNode.children[segment]
+  }
+  return { root: cloned }
+}
+
+function formatPermissionOctal(mode) {
+  const chunks = [mode.slice(1, 4), mode.slice(4, 7), mode.slice(7, 10)]
+  return chunks
+    .map((chunk) => {
+      let value = 0
+      if (chunk[0] === 'r') value += 4
+      if (chunk[1] === 'w') value += 2
+      if (chunk[2] === 'x') value += 1
+      return value
+    })
+    .join('')
+}
+
+function getParentPath(path) {
+  if (path === '/') return '/'
+  const parts = splitPath(path)
+  if (parts.length <= 1) return '/'
+  return `/${parts.slice(0, -1).join('/')}`
+}
+
+function getPermissionChunk(node, user) {
+  const mode = node.mode || defaultMode('/', node.type)
+  if (user === 'root') return 'rwx'
+  if (node.owner === user) return mode.slice(1, 4)
+  if (node.group === user) return mode.slice(4, 7)
+  return mode.slice(7, 10)
+}
+
+function hasPermission(node, user, permission) {
+  const chunk = getPermissionChunk(node, user)
+  if (permission === 'r') return chunk[0] === 'r'
+  if (permission === 'w') return chunk[1] === 'w'
+  if (permission === 'x') return chunk[2] === 'x'
+  return false
+}
+
+function checkParentDirectoryPermission(root, targetPath, user, command) {
+  const parentPath = getParentPath(targetPath)
+  const parentNode = getNodeAtPath(root, parentPath)
+  if (!parentNode || parentNode.type !== 'dir') {
+    return `${command}: cannot access '${targetPath}': No such file or directory`
+  }
+  if (!hasPermission(parentNode, user, 'w') || !hasPermission(parentNode, user, 'x')) {
+    return `${command}: cannot access '${targetPath}': Permission denied`
+  }
+  return null
+}
+
+function usageForCommand(command) {
+  const usageMap = {
+    ls: 'ls [-a] [-l] [path]',
+    cd: 'cd [directory]',
+    pwd: 'pwd',
+    mkdir: 'mkdir directory...',
+    rmdir: 'rmdir directory...',
+    rm: 'rm [-r] path...',
+    cp: 'cp [-r] source destination',
+    mv: 'mv source destination',
+    touch: 'touch file...',
+    stat: 'stat file...',
+    cat: 'cat file...',
+    less: 'less file',
+    more: 'more file',
+    head: 'head [-n N] file...',
+    tail: 'tail [-n N] [-f] file...',
+    find: 'find [path] [-name pattern]',
+    locate: 'locate pattern',
+    grep: 'grep [-r] pattern file...',
+    which: 'which command...',
+    whereis: 'whereis command...',
+    chmod: 'chmod MODE file...',
+    chown: 'chown OWNER[:GROUP] file...',
+    chgrp: 'chgrp GROUP file...',
+    apt: 'apt <update|upgrade|install|remove|search> [args]',
+    uname: 'uname [-a]',
+    hostname: 'hostname',
+    uptime: 'uptime',
+    date: 'date',
+    cal: 'cal',
+    ps: 'ps',
+    top: 'top',
+    htop: 'htop',
+    kill: 'kill [-9] pid...',
+    pkill: 'pkill pattern',
+    ping: 'ping host [-c count]',
+    ifconfig: 'ifconfig',
+    ip: 'ip a',
+    netstat: 'netstat',
+    curl: 'curl URL',
+    wget: 'wget URL [-O file]',
+    tar: 'tar -cvf archive.tar files... | tar -xvf archive.tar',
+    gzip: 'gzip file',
+    gunzip: 'gunzip file.gz',
+    zip: 'zip archive.zip file...',
+    unzip: 'unzip archive.zip',
+    man: 'man command',
+    info: 'info topic',
+    nano: 'nano file',
+    clear: 'clear',
+    help: 'help',
+  }
+  return usageMap[command] || null
 }
 
 function tokenize(input) {
@@ -271,7 +702,7 @@ function tokenize(input) {
 
 function loadFileSystemFromStorage() {
   if (typeof window === 'undefined') {
-    return createDefaultFileSystem()
+    return sanitizeFileSystem(createDefaultFileSystem())
   }
 
   try {
@@ -279,14 +710,14 @@ function loadFileSystemFromStorage() {
     if (raw) {
       const parsed = JSON.parse(raw)
       if (parsed && parsed.type === 'dir') {
-        return parsed
+        return sanitizeFileSystem(parsed)
       }
     }
   } catch {
     // Ignore parse errors and rebuild.
   }
 
-  const initialFileSystem = createDefaultFileSystem()
+  const initialFileSystem = sanitizeFileSystem(createDefaultFileSystem())
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify(initialFileSystem))
   return initialFileSystem
 }
@@ -322,6 +753,184 @@ async function readClipboardText() {
   } catch {
     return null
   }
+}
+
+function loadInstalledPackagesFromStorage() {
+  if (typeof window === 'undefined') return DEFAULT_INSTALLED_PACKAGES
+  try {
+    const raw = window.localStorage.getItem(STORAGE_PACKAGES_KEY)
+    if (!raw) return DEFAULT_INSTALLED_PACKAGES
+    const parsed = JSON.parse(raw)
+    if (Array.isArray(parsed)) return parsed
+  } catch {
+    // Ignore parse errors and fallback.
+  }
+  return DEFAULT_INSTALLED_PACKAGES
+}
+
+function loadBootTimestamp() {
+  if (typeof window === 'undefined') return Date.now()
+  try {
+    const raw = window.localStorage.getItem(STORAGE_BOOT_KEY)
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed) && parsed > 0) return parsed
+  } catch {
+    // Ignore parse errors and recreate boot timestamp.
+  }
+  const now = Date.now()
+  window.localStorage.setItem(STORAGE_BOOT_KEY, String(now))
+  return now
+}
+
+function createDefaultProcesses() {
+  return [
+    { pid: 1, user: 'root', cpu: '0.0', mem: '0.1', tty: '?', time: '00:00:02', cmd: 'systemd' },
+    { pid: 631, user: 'root', cpu: '0.0', mem: '0.2', tty: '?', time: '00:00:00', cmd: 'sshd' },
+    { pid: 921, user: USERNAME, cpu: '0.0', mem: '0.1', tty: 'pts/0', time: '00:00:00', cmd: 'bash' },
+    { pid: 1044, user: USERNAME, cpu: '0.1', mem: '0.3', tty: 'pts/0', time: '00:00:01', cmd: 'terminal-simulator' },
+  ]
+}
+
+function isExecutablePath(path) {
+  return path.startsWith('/bin/') || path.startsWith('/usr/bin/') || path.startsWith('/sbin/')
+}
+
+function defaultMode(path, type) {
+  if (type === 'dir') return 'drwxr-xr-x'
+  if (isExecutablePath(path)) return '-rwxr-xr-x'
+  return '-rw-r--r--'
+}
+
+function defaultOwner(path) {
+  return path.startsWith(`${HOME_PATH}/`) || path === HOME_PATH ? USERNAME : 'root'
+}
+
+function defaultGroup(path) {
+  return path.startsWith(`${HOME_PATH}/`) || path === HOME_PATH ? USERNAME : 'root'
+}
+
+function ensureNodeMetadata(node, path) {
+  const now = new Date().toISOString()
+  return {
+    ...node,
+    mode: node.mode || defaultMode(path, node.type),
+    owner: node.owner || defaultOwner(path),
+    group: node.group || defaultGroup(path),
+    ctime: node.ctime || now,
+    mtime: node.mtime || now,
+  }
+}
+
+function sanitizeFileSystem(node, path = '/') {
+  if (!node || (node.type !== 'dir' && node.type !== 'file')) {
+    return ensureNodeMetadata(dir({}), path)
+  }
+
+  if (node.type === 'file') {
+    const normalized = ensureNodeMetadata(
+      { ...node, content: typeof node.content === 'string' ? node.content : '' },
+      path
+    )
+    return normalized
+  }
+
+  const children = {}
+  for (const [name, child] of Object.entries(node.children || {})) {
+    const childPath = path === '/' ? `/${name}` : `${path}/${name}`
+    children[name] = sanitizeFileSystem(child, childPath)
+  }
+
+  return ensureNodeMetadata({ ...node, children }, path)
+}
+
+function formatLsTime(iso) {
+  const date = new Date(iso || Date.now())
+  return date.toLocaleString('en-US', {
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })
+}
+
+function formatStatTime(iso) {
+  const date = new Date(iso || Date.now())
+  return date.toLocaleString('en-US', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  })
+}
+
+function formatUptimeFromBoot(bootTimestamp) {
+  const totalSeconds = Math.max(0, Math.floor((Date.now() - bootTimestamp) / 1000))
+  const days = Math.floor(totalSeconds / 86400)
+  const hours = Math.floor((totalSeconds % 86400) / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  const pieces = []
+  if (days > 0) pieces.push(`${days} day${days === 1 ? '' : 's'}`)
+  if (hours > 0) pieces.push(`${hours}:${String(minutes).padStart(2, '0')}`)
+  else pieces.push(`${minutes} min`)
+  pieces.push(`${seconds} sec`)
+  return pieces.join(', ')
+}
+
+function buildCalendarText(month = new Date().getMonth(), year = new Date().getFullYear()) {
+  const months = [
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+  ]
+  const weekHeader = 'Su Mo Tu We Th Fr Sa'
+  const firstDay = new Date(year, month, 1).getDay()
+  const daysInMonth = new Date(year, month + 1, 0).getDate()
+  const title = `${months[month]} ${year}`
+  const lines = [title.padStart(Math.floor((20 + title.length) / 2), ' '), weekHeader]
+  let line = ''.padStart(firstDay * 3, ' ')
+  for (let day = 1; day <= daysInMonth; day += 1) {
+    line += `${String(day).padStart(2, ' ')} `
+    if ((firstDay + day) % 7 === 0 || day === daysInMonth) {
+      lines.push(line.trimEnd())
+      line = ''
+    }
+  }
+  return lines.join('\n')
+}
+
+function applyExecutablePermission(mode) {
+  const chars = mode.split('')
+  if (chars[3] !== '-') chars[3] = 'x'
+  if (chars[6] !== '-') chars[6] = 'x'
+  if (chars[9] !== '-') chars[9] = 'x'
+  if (chars[3] === '-') chars[3] = 'x'
+  if (chars[6] === '-') chars[6] = 'x'
+  if (chars[9] === '-') chars[9] = 'x'
+  return chars.join('')
+}
+
+function octalToMode(octal, type) {
+  const digits = octal.split('').map((value) => Number(value))
+  if (digits.length !== 3 || digits.some((digit) => !Number.isInteger(digit) || digit < 0 || digit > 7)) {
+    return null
+  }
+  const symbol = type === 'dir' ? 'd' : '-'
+  const mapDigit = (digit) => `${digit & 4 ? 'r' : '-'}${digit & 2 ? 'w' : '-'}${digit & 1 ? 'x' : '-'}`
+  return `${symbol}${mapDigit(digits[0])}${mapDigit(digits[1])}${mapDigit(digits[2])}`
 }
 function clampNumber(value, min, max) {
   return Math.min(max, Math.max(min, value))
@@ -793,6 +1402,9 @@ function formatNanoPosition(session) {
 
 function App() {
   const [fileSystem, setFileSystem] = useState(loadFileSystemFromStorage)
+  const [installedPackages, setInstalledPackages] = useState(loadInstalledPackagesFromStorage)
+  const [processTable, setProcessTable] = useState(createDefaultProcesses)
+  const [bootTimestamp] = useState(loadBootTimestamp)
   const [currentPath, setCurrentPath] = useState(HOME_PATH)
   const [history, setHistory] = useState([])
   const [inputValue, setInputValue] = useState('')
@@ -823,6 +1435,17 @@ function App() {
       // Keep terminal running even if storage is unavailable.
     }
   }, [fileSystem])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        STORAGE_PACKAGES_KEY,
+        JSON.stringify(installedPackages)
+      )
+    } catch {
+      // Keep terminal running even if storage is unavailable.
+    }
+  }, [installedPackages])
 
   useEffect(() => {
     if (nanoSession) {
@@ -925,6 +1548,8 @@ function App() {
       nextPath: null,
       nextFileSystem: null,
       nextNanoSession: undefined,
+      nextPackages: null,
+      nextProcesses: null,
       clearHistory: false,
     }
 
@@ -934,21 +1559,45 @@ function App() {
     const command = commandName.toLowerCase()
     const args = commandParts.slice(1)
 
+    if (command === '--help') {
+      result.lines.push({
+        type: 'output',
+        text: `Use: <command> --help\nTry: help`,
+      })
+      return result
+    }
+
+    if (args.includes('--help')) {
+      const usage = usageForCommand(command)
+      if (usage) {
+        result.lines.push({ type: 'output', text: `Usage: ${usage}` })
+        return result
+      }
+    }
+
     if (command === 'ls') {
       let showAll = false
+      let longFormat = false
       let pathArg = null
 
       for (const arg of args) {
         if (arg.startsWith('-')) {
-          if (arg.includes('a')) {
-            showAll = true
-            continue
+          for (const flag of arg.slice(1).split('')) {
+            if (flag === 'a') {
+              showAll = true
+              continue
+            }
+            if (flag === 'l') {
+              longFormat = true
+              continue
+            }
+            result.lines.push({
+              type: 'error',
+              text: `ls: invalid option -- '${flag}'`,
+            })
+            return result
           }
-          result.lines.push({
-            type: 'error',
-            text: `ls: invalid option -- '${arg.replace(/-/g, '')}'`,
-          })
-          return result
+          continue
         }
         if (pathArg) {
           result.lines.push({
@@ -972,19 +1621,72 @@ function App() {
       }
 
       if (node.type === 'file') {
-        result.lines.push({
-          type: 'output',
-          text: getBaseName(targetPath),
-        })
+        const normalizedNode = ensureNodeMetadata(node, targetPath)
+        if (longFormat) {
+          const line = `${normalizedNode.mode} 1 ${normalizedNode.owner} ${normalizedNode.group} ${normalizedNode.content.length
+            .toString()
+            .padStart(6, ' ')} ${formatLsTime(normalizedNode.mtime)} ${getBaseName(targetPath)}`
+          result.lines.push({ type: 'output', text: line })
+        } else {
+          result.lines.push({
+            type: 'output',
+            text: getBaseName(targetPath),
+          })
+        }
         return result
       }
 
-      const names = Object.keys(node.children)
-        .filter((name) => showAll || !name.startsWith('.'))
-        .sort((a, b) => a.localeCompare(b))
+      const sortedNames = Object.keys(node.children).sort((a, b) =>
+        a.localeCompare(b)
+      )
 
-      const output = showAll ? ['.', '..', ...names].join('  ') : names.join('  ')
-      result.lines.push({ type: 'output', text: output })
+      const names = sortedNames.filter((name) => showAll || !name.startsWith('.'))
+      if (longFormat) {
+        const detailRows = []
+        const listing = showAll ? ['.', '..', ...names] : names
+        for (const name of listing) {
+          if (name === '.') {
+            const selfNode = ensureNodeMetadata(node, targetPath)
+            detailRows.push(
+              `${selfNode.mode} 2 ${selfNode.owner} ${selfNode.group} ${String(
+                Object.keys(node.children).length
+              ).padStart(6, ' ')} ${formatLsTime(selfNode.mtime)} .`
+            )
+            continue
+          }
+          if (name === '..') {
+            const parentPath = normalizePath('..', targetPath)
+            const parentNode = getNodeAtPath(executionFileSystem, parentPath)
+            const normalizedParent = ensureNodeMetadata(
+              parentNode || dir({}),
+              parentPath
+            )
+            detailRows.push(
+              `${normalizedParent.mode} 2 ${normalizedParent.owner} ${normalizedParent.group} ${String(
+                parentNode && parentNode.type === 'dir'
+                  ? Object.keys(parentNode.children).length
+                  : 0
+              ).padStart(6, ' ')} ${formatLsTime(normalizedParent.mtime)} ..`
+            )
+            continue
+          }
+          const childPath = targetPath === '/' ? `/${name}` : `${targetPath}/${name}`
+          const childNode = ensureNodeMetadata(node.children[name], childPath)
+          const size =
+            childNode.type === 'file'
+              ? childNode.content.length
+              : Object.keys(childNode.children).length
+          detailRows.push(
+            `${childNode.mode} ${childNode.type === 'dir' ? 2 : 1} ${childNode.owner} ${childNode.group} ${String(
+              size
+            ).padStart(6, ' ')} ${formatLsTime(childNode.mtime)} ${name}`
+          )
+        }
+        result.lines.push({ type: 'output', text: detailRows.join('\n') })
+      } else {
+        const output = showAll ? ['.', '..', ...names].join('  ') : names.join('  ')
+        result.lines.push({ type: 'output', text: output })
+      }
       return result
     }
 
@@ -1014,6 +1716,171 @@ function App() {
       }
 
       result.nextPath = targetPath
+      return result
+    }
+
+    if (command === 'touch') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'touch: missing file operand' })
+        return result
+      }
+
+      let workingFileSystem = executionFileSystem
+      let changed = false
+      for (const arg of args) {
+        const targetPath = normalizePath(arg, executionPath)
+        const touchResult = touchPath(workingFileSystem, targetPath)
+        if (touchResult.error) {
+          result.lines.push({ type: 'error', text: touchResult.error })
+          continue
+        }
+        workingFileSystem = touchResult.root
+        changed = true
+      }
+      if (changed) {
+        result.nextFileSystem = workingFileSystem
+      }
+      return result
+    }
+
+    if (command === 'rmdir') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'rmdir: missing operand' })
+        return result
+      }
+
+      let workingFileSystem = executionFileSystem
+      let changed = false
+      for (const arg of args) {
+        const targetPath = normalizePath(arg, executionPath)
+        const removeResult = removeDirectoryPath(workingFileSystem, targetPath)
+        if (removeResult.error) {
+          result.lines.push({ type: 'error', text: removeResult.error })
+          continue
+        }
+        workingFileSystem = removeResult.root
+        changed = true
+      }
+      if (changed) result.nextFileSystem = workingFileSystem
+      return result
+    }
+
+    if (command === 'rm') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'rm: missing operand' })
+        return result
+      }
+
+      let recursive = false
+      const targets = []
+      for (const arg of args) {
+        if (arg.startsWith('-')) {
+          if (arg.includes('r')) recursive = true
+          continue
+        }
+        targets.push(arg)
+      }
+      if (targets.length === 0) {
+        result.lines.push({ type: 'error', text: 'rm: missing operand' })
+        return result
+      }
+
+      let workingFileSystem = executionFileSystem
+      let changed = false
+      for (const target of targets) {
+        const targetPath = normalizePath(target, executionPath)
+        const removeResult = removePath(workingFileSystem, targetPath, recursive)
+        if (removeResult.error) {
+          result.lines.push({ type: 'error', text: removeResult.error })
+          continue
+        }
+        workingFileSystem = removeResult.root
+        changed = true
+      }
+      if (changed) result.nextFileSystem = workingFileSystem
+      return result
+    }
+
+    if (command === 'cp') {
+      let recursive = false
+      const values = []
+      for (const arg of args) {
+        if (arg.startsWith('-')) {
+          if (arg.includes('r')) recursive = true
+          continue
+        }
+        values.push(arg)
+      }
+      if (values.length < 2) {
+        result.lines.push({
+          type: 'error',
+          text: 'cp: missing destination file operand',
+        })
+        return result
+      }
+      const sourcePath = normalizePath(values[0], executionPath)
+      const destinationPath = normalizePath(values[1], executionPath)
+      const copyResult = copyPath(
+        executionFileSystem,
+        sourcePath,
+        destinationPath,
+        recursive
+      )
+      if (copyResult.error) {
+        result.lines.push({ type: 'error', text: copyResult.error })
+        return result
+      }
+      result.nextFileSystem = copyResult.root
+      return result
+    }
+
+    if (command === 'mv') {
+      if (args.length < 2) {
+        result.lines.push({
+          type: 'error',
+          text: 'mv: missing destination file operand',
+        })
+        return result
+      }
+      const sourcePath = normalizePath(args[0], executionPath)
+      const destinationPath = normalizePath(args[1], executionPath)
+      const moveResult = movePath(executionFileSystem, sourcePath, destinationPath)
+      if (moveResult.error) {
+        result.lines.push({ type: 'error', text: moveResult.error })
+        return result
+      }
+      result.nextFileSystem = moveResult.root
+      return result
+    }
+
+    if (command === 'stat') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'stat: missing operand' })
+        return result
+      }
+
+      const rows = []
+      for (const arg of args) {
+        const targetPath = normalizePath(arg, executionPath)
+        const node = getNodeAtPath(executionFileSystem, targetPath)
+        if (!node) {
+          rows.push(`stat: cannot stat '${arg}': No such file or directory`)
+          continue
+        }
+        const meta = ensureNodeMetadata(node, targetPath)
+        const size =
+          node.type === 'file' ? node.content.length : Object.keys(node.children).length
+        rows.push(
+          [
+            `  File: ${targetPath}`,
+            `  Size: ${size}\tType: ${node.type === 'dir' ? 'directory' : 'regular file'}`,
+            `Access: (${formatPermissionOctal(meta.mode)}/${meta.mode})  Uid: (${meta.owner})   Gid: (${meta.group})`,
+            `Modify: ${formatStatTime(meta.mtime)}`,
+            `Change: ${formatStatTime(meta.ctime)}`,
+          ].join('\n')
+        )
+      }
+      result.lines.push({ type: 'output', text: rows.join('\n') })
       return result
     }
 
@@ -1055,6 +1922,110 @@ function App() {
       return result
     }
 
+    if (command === 'head' || command === 'tail') {
+      if (args.length === 0) {
+        result.lines.push({
+          type: 'error',
+          text: `${command}: missing file operand`,
+        })
+        return result
+      }
+
+      let lineCount = 10
+      let follow = false
+      const files = []
+      for (let index = 0; index < args.length; index += 1) {
+        const arg = args[index]
+        if (arg === '-n') {
+          const value = Number(args[index + 1])
+          if (!Number.isFinite(value)) {
+            result.lines.push({
+              type: 'error',
+              text: `${command}: invalid number of lines`,
+            })
+            return result
+          }
+          lineCount = Math.max(1, Math.floor(value))
+          index += 1
+          continue
+        }
+        if (arg === '-f' && command === 'tail') {
+          follow = true
+          continue
+        }
+        files.push(arg)
+      }
+
+      if (files.length === 0) {
+        result.lines.push({
+          type: 'error',
+          text: `${command}: missing file operand`,
+        })
+        return result
+      }
+
+      const outputs = []
+      for (const entry of files) {
+        const targetPath = normalizePath(entry, executionPath)
+        const node = getNodeAtPath(executionFileSystem, targetPath)
+        if (!node) {
+          outputs.push(`${command}: cannot open '${entry}' for reading: No such file or directory`)
+          continue
+        }
+        if (node.type !== 'file') {
+          outputs.push(`${command}: error reading '${entry}': Is a directory`)
+          continue
+        }
+
+        const lines = node.content.split('\n')
+        const selected =
+          command === 'head'
+            ? lines.slice(0, lineCount)
+            : lines.slice(Math.max(lines.length - lineCount, 0))
+        let text = selected.join('\n')
+        if (follow && command === 'tail') {
+          text += '\n==> waiting for appended data (simulation) <=='
+        }
+        outputs.push(text)
+      }
+
+      result.lines.push({ type: 'output', text: outputs.join('\n') })
+      return result
+    }
+
+    if (command === 'less' || command === 'more') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: `${command}: missing file operand` })
+        return result
+      }
+      const targetPath = normalizePath(args[0], executionPath)
+      const node = getNodeAtPath(executionFileSystem, targetPath)
+      if (!node) {
+        result.lines.push({
+          type: 'error',
+          text: `${command}: ${args[0]}: No such file or directory`,
+        })
+        return result
+      }
+      if (node.type !== 'file') {
+        result.lines.push({
+          type: 'error',
+          text: `${command}: ${args[0]}: Is a directory`,
+        })
+        return result
+      }
+      const lines = node.content.split('\n')
+      const pageSize = 20
+      const pages = []
+      for (let index = 0; index < lines.length; index += pageSize) {
+        const chunk = lines.slice(index, index + pageSize).join('\n')
+        const marker = index + pageSize < lines.length ? '\n--More--' : ''
+        pages.push(chunk + marker)
+      }
+      result.lines.push({ type: 'output', text: pages.join('\n') })
+      return result
+    }
+
     if (command === 'mkdir') {
       if (args.length === 0) {
         result.lines.push({
@@ -1084,6 +2055,152 @@ function App() {
         result.nextFileSystem = workingFileSystem
       }
 
+      return result
+    }
+
+    if (command === 'find') {
+      const startArg = args[0] && !args[0].startsWith('-') ? args[0] : '.'
+      const rootPath = normalizePath(startArg, executionPath)
+      const rootNode = getNodeAtPath(executionFileSystem, rootPath)
+      if (!rootNode) {
+        result.lines.push({
+          type: 'error',
+          text: `find: '${startArg}': No such file or directory`,
+        })
+        return result
+      }
+
+      let namePattern = null
+      const nameFlagIndex = args.findIndex((item) => item === '-name')
+      if (nameFlagIndex !== -1) {
+        namePattern = args[nameFlagIndex + 1] || null
+      }
+
+      const matcher = (path) => {
+        if (!namePattern) return true
+        const baseName = getBaseName(path)
+        const regex = new RegExp(
+          `^${namePattern
+            .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+            .replace(/\*/g, '.*')
+            .replace(/\?/g, '.')}$`
+        )
+        return regex.test(baseName)
+      }
+
+      const matches = []
+      walkFileSystem(rootNode, rootPath, (_, path) => {
+        if (matcher(path)) matches.push(path)
+      })
+      result.lines.push({ type: 'output', text: matches.join('\n') })
+      return result
+    }
+
+    if (command === 'locate') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'locate: missing pattern' })
+        return result
+      }
+      const term = args.join(' ').toLowerCase()
+      const matches = []
+      walkFileSystem(executionFileSystem, '/', (_, path) => {
+        if (path.toLowerCase().includes(term)) matches.push(path)
+      })
+      result.lines.push({ type: 'output', text: matches.join('\n') || '' })
+      return result
+    }
+
+    if (command === 'grep') {
+      if (args.length < 2) {
+        result.lines.push({
+          type: 'error',
+          text: 'grep: usage: grep [-r] PATTERN FILE...',
+        })
+        return result
+      }
+
+      let recursive = false
+      const values = []
+      for (const arg of args) {
+        if (arg === '-r' || arg === '-R') {
+          recursive = true
+          continue
+        }
+        values.push(arg)
+      }
+
+      if (values.length < 2) {
+        result.lines.push({
+          type: 'error',
+          text: 'grep: missing file operand',
+        })
+        return result
+      }
+
+      const pattern = values[0]
+      const targets = values.slice(1)
+      const outputs = []
+
+      const scanFile = (displayName, fileNode) => {
+        const lines = fileNode.content.split('\n')
+        lines.forEach((line, index) => {
+          if (line.includes(pattern)) {
+            outputs.push(`${displayName}:${index + 1}:${line}`)
+          }
+        })
+      }
+
+      for (const target of targets) {
+        const targetPath = normalizePath(target, executionPath)
+        const node = getNodeAtPath(executionFileSystem, targetPath)
+        if (!node) {
+          outputs.push(`grep: ${target}: No such file or directory`)
+          continue
+        }
+        if (node.type === 'file') {
+          scanFile(targetPath, node)
+          continue
+        }
+        if (!recursive) {
+          outputs.push(`grep: ${target}: Is a directory`)
+          continue
+        }
+
+        walkFileSystem(node, targetPath, (walkNode, walkPath) => {
+          if (walkNode.type === 'file') {
+            scanFile(walkPath, walkNode)
+          }
+        })
+      }
+
+      result.lines.push({ type: 'output', text: outputs.join('\n') })
+      return result
+    }
+
+    if (command === 'which') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'which: missing command name' })
+        return result
+      }
+      const outputs = args
+        .map((name) => COMMAND_PATHS[name])
+        .filter(Boolean)
+        .join('\n')
+      result.lines.push({ type: 'output', text: outputs })
+      return result
+    }
+
+    if (command === 'whereis') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'whereis: missing operand' })
+        return result
+      }
+      const outputs = args.map((name) => {
+        const path = COMMAND_PATHS[name] || ''
+        const manPath = path ? `/usr/share/man/man1/${name}.1.gz` : ''
+        return `${name}: ${path} ${manPath}`.trim()
+      })
+      result.lines.push({ type: 'output', text: outputs.join('\n') })
       return result
     }
 
@@ -1122,6 +2239,663 @@ function App() {
       return result
     }
 
+    if (command === 'chmod') {
+      if (args.length < 2) {
+        result.lines.push({
+          type: 'error',
+          text: 'chmod: missing operand',
+        })
+        return result
+      }
+
+      const modeArg = args[0]
+      if (!/^[0-7]{3}$/.test(modeArg) && modeArg !== '+x') {
+        result.lines.push({
+          type: 'error',
+          text: `chmod: invalid mode: '${modeArg}'`,
+        })
+        return result
+      }
+      let workingFileSystem = executionFileSystem
+      let changed = false
+
+      for (const rawTarget of args.slice(1)) {
+        const targetPath = normalizePath(rawTarget, executionPath)
+        const chmodResult = mutateNodeAtPath(
+          workingFileSystem,
+          targetPath,
+          (node, path) => {
+            const meta = ensureNodeMetadata(node, path)
+            let nextMode = meta.mode
+            if (/^[0-7]{3}$/.test(modeArg)) {
+              const octalMode = octalToMode(modeArg, node.type)
+              if (!octalMode) return meta
+              nextMode = octalMode
+            } else if (modeArg === '+x') {
+              nextMode = applyExecutablePermission(meta.mode)
+            }
+            return { ...meta, mode: nextMode, mtime: new Date().toISOString() }
+          },
+          'chmod'
+        )
+
+        if (chmodResult.error) {
+          result.lines.push({ type: 'error', text: chmodResult.error })
+          continue
+        }
+        workingFileSystem = chmodResult.root
+        changed = true
+      }
+
+      if (changed) result.nextFileSystem = workingFileSystem
+      return result
+    }
+
+    if (command === 'chown') {
+      if (args.length < 2) {
+        result.lines.push({
+          type: 'error',
+          text: 'chown: missing operand',
+        })
+        return result
+      }
+      const ownerValue = args[0]
+      const [owner, group] = ownerValue.split(':')
+      let workingFileSystem = executionFileSystem
+      let changed = false
+
+      for (const rawTarget of args.slice(1)) {
+        const targetPath = normalizePath(rawTarget, executionPath)
+        const chownResult = mutateNodeAtPath(
+          workingFileSystem,
+          targetPath,
+          (node, path) => {
+            const meta = ensureNodeMetadata(node, path)
+            return {
+              ...meta,
+              owner: owner || meta.owner,
+              group: group || meta.group,
+              mtime: new Date().toISOString(),
+            }
+          },
+          'chown'
+        )
+
+        if (chownResult.error) {
+          result.lines.push({ type: 'error', text: chownResult.error })
+          continue
+        }
+        workingFileSystem = chownResult.root
+        changed = true
+      }
+
+      if (changed) result.nextFileSystem = workingFileSystem
+      return result
+    }
+
+    if (command === 'chgrp') {
+      if (args.length < 2) {
+        result.lines.push({
+          type: 'error',
+          text: 'chgrp: missing operand',
+        })
+        return result
+      }
+
+      const group = args[0]
+      let workingFileSystem = executionFileSystem
+      let changed = false
+
+      for (const rawTarget of args.slice(1)) {
+        const targetPath = normalizePath(rawTarget, executionPath)
+        const chgrpResult = mutateNodeAtPath(
+          workingFileSystem,
+          targetPath,
+          (node, path) => ({
+            ...ensureNodeMetadata(node, path),
+            group,
+            mtime: new Date().toISOString(),
+          }),
+          'chgrp'
+        )
+
+        if (chgrpResult.error) {
+          result.lines.push({ type: 'error', text: chgrpResult.error })
+          continue
+        }
+        workingFileSystem = chgrpResult.root
+        changed = true
+      }
+
+      if (changed) result.nextFileSystem = workingFileSystem
+      return result
+    }
+
+    if (command === 'apt') {
+      if (args.length === 0) {
+        result.lines.push({
+          type: 'error',
+          text: 'apt: missing subcommand (update, upgrade, install, remove, search)',
+        })
+        return result
+      }
+
+      const sub = args[0]
+      if (sub === 'update') {
+        result.lines.push({
+          type: 'output',
+          text: 'Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease\nReading package lists... Done',
+        })
+        return result
+      }
+
+      if (sub === 'upgrade') {
+        result.lines.push({
+          type: 'output',
+          text: 'Reading package lists... Done\nBuilding dependency tree... Done\n0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.',
+        })
+        return result
+      }
+
+      if (sub === 'search') {
+        const term = (args[1] || '').toLowerCase()
+        const hits = AVAILABLE_PACKAGES.filter(
+          (pkg) =>
+            pkg.name.toLowerCase().includes(term) ||
+            pkg.description.toLowerCase().includes(term)
+        )
+        const output = hits
+          .map((pkg) => `${pkg.name}/${pkg.version} - ${pkg.description}`)
+          .join('\n')
+        result.lines.push({ type: 'output', text: output })
+        return result
+      }
+
+      if (sub === 'install' || sub === 'remove') {
+        const targets = args.slice(1)
+        if (targets.length === 0) {
+          result.lines.push({
+            type: 'error',
+            text: `apt ${sub}: no package specified`,
+          })
+          return result
+        }
+        const installedSet = new Set(installedPackages)
+        for (const pkg of targets) {
+          if (sub === 'install') {
+            installedSet.add(pkg)
+          } else {
+            installedSet.delete(pkg)
+          }
+        }
+        result.nextPackages = Array.from(installedSet).sort((a, b) =>
+          a.localeCompare(b)
+        )
+        result.lines.push({
+          type: 'output',
+          text:
+            sub === 'install'
+              ? `Installed: ${targets.join(', ')}`
+              : `Removed: ${targets.join(', ')}`,
+        })
+        return result
+      }
+
+      result.lines.push({
+        type: 'error',
+        text: `apt: unknown subcommand '${sub}'`,
+      })
+      return result
+    }
+
+    if (command === 'uname') {
+      const hasAll = args.includes('-a')
+      result.lines.push({
+        type: 'output',
+        text: hasAll
+          ? 'Linux ubuntu 6.8.0-generic #1 SMP PREEMPT_DYNAMIC x86_64 GNU/Linux'
+          : 'Linux',
+      })
+      return result
+    }
+
+    if (command === 'hostname') {
+      result.lines.push({ type: 'output', text: HOSTNAME })
+      return result
+    }
+
+    if (command === 'uptime') {
+      result.lines.push({
+        type: 'output',
+        text: `up ${formatUptimeFromBoot(bootTimestamp)},  1 user,  load average: 0.08, 0.06, 0.04`,
+      })
+      return result
+    }
+
+    if (command === 'date') {
+      result.lines.push({
+        type: 'output',
+        text: new Date().toString(),
+      })
+      return result
+    }
+
+    if (command === 'cal') {
+      result.lines.push({
+        type: 'output',
+        text: buildCalendarText(),
+      })
+      return result
+    }
+
+    if (command === 'ps') {
+      const header = '  PID TTY          TIME CMD'
+      const rows = processTable.map(
+        (proc) => `${String(proc.pid).padStart(5, ' ')} ${proc.tty.padEnd(12, ' ')} ${proc.time.padEnd(8, ' ')} ${proc.cmd}`
+      )
+      result.lines.push({ type: 'output', text: [header, ...rows].join('\n') })
+      return result
+    }
+
+    if (command === 'top' || command === 'htop') {
+      const summary = [
+        `top - ${new Date().toLocaleTimeString()} up ${formatUptimeFromBoot(bootTimestamp)}, 1 user, load average: 0.10, 0.07, 0.05`,
+        'Tasks: 4 total, 1 running, 3 sleeping, 0 stopped, 0 zombie',
+        '%Cpu(s):  3.2 us,  1.0 sy, 95.8 id',
+        'MiB Mem :  15938.0 total,   6120.0 free,   4210.0 used,   5608.0 buff/cache',
+        '',
+        '  PID USER      %CPU %MEM COMMAND',
+      ]
+      const rows = processTable.map(
+        (proc) =>
+          `${String(proc.pid).padStart(5, ' ')} ${proc.user.padEnd(8, ' ')} ${String(proc.cpu).padStart(4, ' ')} ${String(proc.mem).padStart(4, ' ')} ${proc.cmd}`
+      )
+      result.lines.push({ type: 'output', text: [...summary, ...rows].join('\n') })
+      return result
+    }
+
+    if (command === 'kill') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'kill: usage: kill [-9] pid ...' })
+        return result
+      }
+      const ids = args.filter((arg) => !arg.startsWith('-')).map((arg) => Number(arg))
+      if (ids.length === 0 || ids.some((value) => !Number.isFinite(value))) {
+        result.lines.push({ type: 'error', text: 'kill: invalid pid' })
+        return result
+      }
+
+      const nextProcesses = processTable.filter(
+        (proc) => !ids.includes(proc.pid) || proc.pid === 1
+      )
+      result.nextProcesses = nextProcesses
+      result.lines.push({ type: 'output', text: '' })
+      return result
+    }
+
+    if (command === 'pkill') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'pkill: missing pattern' })
+        return result
+      }
+      const pattern = args[0].toLowerCase()
+      const nextProcesses = processTable.filter((proc) => {
+        if (proc.pid === 1) return true
+        return !proc.cmd.toLowerCase().includes(pattern)
+      })
+      result.nextProcesses = nextProcesses
+      result.lines.push({ type: 'output', text: '' })
+      return result
+    }
+
+    if (command === 'ping') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'ping: missing host operand' })
+        return result
+      }
+      const host = args[0]
+      const countIndex = args.findIndex((item) => item === '-c')
+      const count =
+        countIndex !== -1 && Number.isFinite(Number(args[countIndex + 1]))
+          ? Math.max(1, Number(args[countIndex + 1]))
+          : 4
+      const lines = [`PING ${host} (${host}) 56(84) bytes of data.`]
+      for (let i = 1; i <= count; i += 1) {
+        const time = (12 + Math.random() * 30).toFixed(2)
+        lines.push(`64 bytes from ${host}: icmp_seq=${i} ttl=58 time=${time} ms`)
+      }
+      lines.push(`--- ${host} ping statistics ---`)
+      lines.push(`${count} packets transmitted, ${count} received, 0% packet loss`)
+      result.lines.push({ type: 'output', text: lines.join('\n') })
+      return result
+    }
+
+    if (command === 'ifconfig') {
+      result.lines.push({
+        type: 'output',
+        text:
+          'eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\n' +
+          '        inet 192.168.0.42  netmask 255.255.255.0  broadcast 192.168.0.255\n' +
+          '        ether 52:54:00:12:34:56  txqueuelen 1000  (Ethernet)',
+      })
+      return result
+    }
+
+    if (command === 'ip' && args[0] === 'a') {
+      result.lines.push({
+        type: 'output',
+        text:
+          '2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n' +
+          '    inet 192.168.0.42/24 brd 192.168.0.255 scope global eth0\n' +
+          '       valid_lft forever preferred_lft forever',
+      })
+      return result
+    }
+
+    if (command === 'ip') {
+      result.lines.push({ type: 'error', text: 'ip: use "ip a" in this simulator' })
+      return result
+    }
+
+    if (command === 'netstat') {
+      result.lines.push({
+        type: 'output',
+        text:
+          'Active Internet connections (servers and established)\n' +
+          'Proto Recv-Q Send-Q Local Address           Foreign Address         State\n' +
+          'tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN\n' +
+          'tcp        0      0 192.168.0.42:51422      93.184.216.34:443       ESTABLISHED',
+      })
+      return result
+    }
+
+    if (command === 'curl') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'curl: no URL specified!' })
+        return result
+      }
+      const url = args[0]
+      result.lines.push({
+        type: 'output',
+        text: `<!doctype html>\n<!-- simulated response from ${url} -->\n<html><body>curl simulation</body></html>`,
+      })
+      return result
+    }
+
+    if (command === 'wget') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'wget: missing URL' })
+        return result
+      }
+      const url = args[0]
+      let outputName = getBaseName(url)
+      const outputIndex = args.findIndex((arg) => arg === '-O')
+      if (outputIndex !== -1 && args[outputIndex + 1]) {
+        outputName = args[outputIndex + 1]
+      }
+      const destinationPath = normalizePath(outputName, executionPath)
+      const content = `Downloaded from ${url}\nDate: ${new Date().toISOString()}\n`
+      const writeResult = writeFileAtPath(executionFileSystem, destinationPath, content)
+      if (writeResult.error) {
+        result.lines.push({ type: 'error', text: writeResult.error })
+        return result
+      }
+      result.nextFileSystem = writeResult.root
+      result.lines.push({
+        type: 'output',
+        text: `Saving to: '${outputName}'\n${content.length} bytes saved`,
+      })
+      return result
+    }
+
+    if (command === 'tar') {
+      if (args.length < 3) {
+        result.lines.push({
+          type: 'error',
+          text: 'tar: usage: tar -cvf archive.tar file... | tar -xvf archive.tar',
+        })
+        return result
+      }
+      const modeArg = args[0]
+      if (modeArg === '-cvf') {
+        const archivePath = normalizePath(args[1], executionPath)
+        const inputs = args.slice(2)
+        const entries = []
+        for (const input of inputs) {
+          const inputPath = normalizePath(input, executionPath)
+          const node = getNodeAtPath(executionFileSystem, inputPath)
+          if (!node) {
+            result.lines.push({
+              type: 'error',
+              text: `tar: ${input}: Cannot stat: No such file or directory`,
+            })
+            continue
+          }
+          walkFileSystem(node, inputPath, (walkNode, walkPath) => {
+            if (walkNode.type === 'file') {
+              entries.push({ path: walkPath, content: walkNode.content })
+            }
+          })
+          if (node.type === 'dir' && entries.length === 0) {
+            entries.push({ path: inputPath, content: '' })
+          }
+        }
+        const archiveContent = `TAR_SIM_V1\n${JSON.stringify(entries)}`
+        const writeResult = writeFileAtPath(
+          executionFileSystem,
+          archivePath,
+          archiveContent
+        )
+        if (writeResult.error) {
+          result.lines.push({ type: 'error', text: writeResult.error })
+          return result
+        }
+        result.nextFileSystem = writeResult.root
+        result.lines.push({ type: 'output', text: entries.map((item) => item.path).join('\n') })
+        return result
+      }
+      if (modeArg === '-xvf') {
+        const archivePath = normalizePath(args[1], executionPath)
+        const archiveNode = getNodeAtPath(executionFileSystem, archivePath)
+        if (!archiveNode || archiveNode.type !== 'file') {
+          result.lines.push({ type: 'error', text: `tar: ${args[1]}: Cannot open` })
+          return result
+        }
+        if (!archiveNode.content.startsWith('TAR_SIM_V1\n')) {
+          result.lines.push({ type: 'error', text: 'tar: This does not look like a tar archive' })
+          return result
+        }
+        let entries = []
+        try {
+          entries = JSON.parse(archiveNode.content.slice('TAR_SIM_V1\n'.length))
+        } catch {
+          result.lines.push({ type: 'error', text: 'tar: Corrupted archive' })
+          return result
+        }
+        let workingFileSystem = executionFileSystem
+        const extracted = []
+        for (const entry of entries) {
+          const relative = entry.path.startsWith('/') ? entry.path.slice(1) : entry.path
+          const destinationPath = normalizePath(relative, executionPath)
+          const parentPath = destinationPath.split('/').slice(0, -1).join('/') || '/'
+          const ensured = ensureDirectoryPath(workingFileSystem, parentPath)
+          if (ensured.error) continue
+          const writeResult = writeFileAtPath(ensured.root, destinationPath, entry.content)
+          if (writeResult.error) continue
+          workingFileSystem = writeResult.root
+          extracted.push(destinationPath)
+        }
+        result.nextFileSystem = workingFileSystem
+        result.lines.push({ type: 'output', text: extracted.join('\n') })
+        return result
+      }
+    }
+
+    if (command === 'gzip' || command === 'gunzip') {
+      if (args.length === 0) {
+        result.lines.push({
+          type: 'error',
+          text: `${command}: missing file operand`,
+        })
+        return result
+      }
+      const targetPath = normalizePath(args[0], executionPath)
+      const node = getNodeAtPath(executionFileSystem, targetPath)
+      if (!node || node.type !== 'file') {
+        result.lines.push({ type: 'error', text: `${command}: ${args[0]}: No such file` })
+        return result
+      }
+
+      if (command === 'gzip') {
+        const encoded = btoa(unescape(encodeURIComponent(node.content)))
+        const gzPath = `${targetPath}.gz`
+        let workingFileSystem = executionFileSystem
+        const writeResult = writeFileAtPath(workingFileSystem, gzPath, `GZIP_SIM_V1\n${encoded}`)
+        if (writeResult.error) {
+          result.lines.push({ type: 'error', text: writeResult.error })
+          return result
+        }
+        workingFileSystem = writeResult.root
+        const removeResult = removePath(workingFileSystem, targetPath, false)
+        if (removeResult.error) {
+          result.lines.push({ type: 'error', text: removeResult.error })
+          return result
+        }
+        result.nextFileSystem = removeResult.root
+        return result
+      }
+
+      if (!targetPath.endsWith('.gz') || !node.content.startsWith('GZIP_SIM_V1\n')) {
+        result.lines.push({ type: 'error', text: `gunzip: ${args[0]}: not in gzip format` })
+        return result
+      }
+      const decoded = decodeURIComponent(escape(atob(node.content.slice('GZIP_SIM_V1\n'.length))))
+      const destinationPath = targetPath.slice(0, -3)
+      let workingFileSystem = executionFileSystem
+      const writeResult = writeFileAtPath(workingFileSystem, destinationPath, decoded)
+      if (writeResult.error) {
+        result.lines.push({ type: 'error', text: writeResult.error })
+        return result
+      }
+      workingFileSystem = writeResult.root
+      const removeResult = removePath(workingFileSystem, targetPath, false)
+      if (removeResult.error) {
+        result.lines.push({ type: 'error', text: removeResult.error })
+        return result
+      }
+      result.nextFileSystem = removeResult.root
+      return result
+    }
+
+    if (command === 'zip') {
+      if (args.length < 2) {
+        result.lines.push({
+          type: 'error',
+          text: 'zip: usage: zip archive.zip file...',
+        })
+        return result
+      }
+      const archivePath = normalizePath(args[0], executionPath)
+      const entries = []
+      for (const item of args.slice(1)) {
+        const itemPath = normalizePath(item, executionPath)
+        const node = getNodeAtPath(executionFileSystem, itemPath)
+        if (!node) continue
+        walkFileSystem(node, itemPath, (walkNode, walkPath) => {
+          if (walkNode.type === 'file') {
+            entries.push({ path: walkPath, content: walkNode.content })
+          }
+        })
+      }
+      const writeResult = writeFileAtPath(
+        executionFileSystem,
+        archivePath,
+        `ZIP_SIM_V1\n${JSON.stringify(entries)}`
+      )
+      if (writeResult.error) {
+        result.lines.push({ type: 'error', text: writeResult.error })
+        return result
+      }
+      result.nextFileSystem = writeResult.root
+      result.lines.push({
+        type: 'output',
+        text: entries.map((entry) => `adding: ${entry.path}`).join('\n'),
+      })
+      return result
+    }
+
+    if (command === 'unzip') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'unzip: missing file operand' })
+        return result
+      }
+      const archivePath = normalizePath(args[0], executionPath)
+      const archiveNode = getNodeAtPath(executionFileSystem, archivePath)
+      if (!archiveNode || archiveNode.type !== 'file') {
+        result.lines.push({ type: 'error', text: `unzip: cannot find ${args[0]}` })
+        return result
+      }
+      if (!archiveNode.content.startsWith('ZIP_SIM_V1\n')) {
+        result.lines.push({ type: 'error', text: `unzip:  ${args[0]} is not a zip file` })
+        return result
+      }
+      let entries = []
+      try {
+        entries = JSON.parse(archiveNode.content.slice('ZIP_SIM_V1\n'.length))
+      } catch {
+        result.lines.push({ type: 'error', text: 'unzip: corrupted zip file' })
+        return result
+      }
+      let workingFileSystem = executionFileSystem
+      const extracted = []
+      for (const entry of entries) {
+        const relative = entry.path.startsWith('/') ? entry.path.slice(1) : entry.path
+        const destinationPath = normalizePath(relative, executionPath)
+        const parentPath = destinationPath.split('/').slice(0, -1).join('/') || '/'
+        const ensured = ensureDirectoryPath(workingFileSystem, parentPath)
+        if (ensured.error) continue
+        const writeResult = writeFileAtPath(ensured.root, destinationPath, entry.content)
+        if (writeResult.error) continue
+        workingFileSystem = writeResult.root
+        extracted.push(destinationPath)
+      }
+      result.nextFileSystem = workingFileSystem
+      result.lines.push({ type: 'output', text: extracted.join('\n') })
+      return result
+    }
+
+    if (command === 'man') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'man: missing command name' })
+        return result
+      }
+      const target = args[0]
+      const manText = [
+        `NAME`,
+        `    ${target} - simulated Linux command`,
+        ``,
+        `SYNOPSIS`,
+        `    ${target} [OPTIONS]`,
+        ``,
+        `DESCRIPTION`,
+        `    This terminal simulator implements a browser-safe version of '${target}'.`,
+      ].join('\n')
+      result.lines.push({ type: 'output', text: manText })
+      return result
+    }
+
+    if (command === 'info') {
+      if (args.length === 0) {
+        result.lines.push({ type: 'error', text: 'info: missing topic' })
+        return result
+      }
+      result.lines.push({
+        type: 'output',
+        text: `Info entry for '${args[0]}'\nUse 'man ${args[0]}' for manual-style help.`,
+      })
+      return result
+    }
+
     if (command === 'clear') {
       result.clearHistory = true
       return result
@@ -1138,7 +2912,12 @@ function App() {
     if (command === 'help') {
       result.lines.push({
         type: 'output',
-        text: 'Comandos: ls, cd, cat, mkdir, nano, clear, pwd, help',
+        text:
+          'Comandos: ls, cd, pwd, mkdir, rmdir, rm, cp, mv, touch, stat, ' +
+          'cat, less, more, head, tail, find, locate, grep, which, whereis, ' +
+          'chmod, chown, chgrp, apt, uname, hostname, uptime, date, cal, ' +
+          'ps, top, htop, kill, pkill, ping, ifconfig, ip a, netstat, curl, wget, ' +
+          'tar, gzip, gunzip, zip, unzip, man, info, nano, clear, help',
       })
       return result
     }
@@ -1188,6 +2967,14 @@ function App() {
 
     if (executionResult.nextFileSystem) {
       setFileSystem(executionResult.nextFileSystem)
+    }
+
+    if (executionResult.nextPackages) {
+      setInstalledPackages(executionResult.nextPackages)
+    }
+
+    if (executionResult.nextProcesses) {
+      setProcessTable(executionResult.nextProcesses)
     }
 
     if (executionResult.nextNanoSession !== undefined) {
