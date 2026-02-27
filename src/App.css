@@ -260,60 +260,129 @@
   border: 1px solid #2b3a48;
   border-radius: 0.55rem;
   overflow: hidden;
-  background: #05101a;
+  background: #020b14;
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
 }
 
-.nano-header,
-.nano-footer {
+.nano-topbar {
   display: flex;
   justify-content: space-between;
-  gap: 0.75rem;
-  padding: 0.38rem 0.6rem;
-  background: #10202c;
-  color: #a7bfce;
-  font-size: 0.76rem;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.32rem 0.7rem;
+  background: #1f4d78;
+  color: #f1f8ff;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.nano-footer {
-  border-top: 1px solid #253341;
-  flex-wrap: wrap;
+.nano-topbar-file {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.nano-textarea {
-  width: 100%;
-  min-height: min(380px, 42vh);
-  resize: vertical;
-  border: 0;
-  padding: 0.82rem;
-  color: #f6fbff;
-  background: #030c15;
-  font: inherit;
-  line-height: 1.55;
+.nano-buffer {
+  position: relative;
+  min-height: min(430px, 50vh);
+  padding: 0.35rem 0.45rem;
+  background: #020b14;
+  color: #e5f0ff;
+  font-size: clamp(0.8rem, 0.95vw, 0.92rem);
+  line-height: 1.38;
 }
 
-.nano-textarea:focus {
+.nano-line {
+  min-height: 1.38em;
+  white-space: pre;
+  cursor: text;
+}
+
+.nano-line-active {
+  color: #f8fcff;
+}
+
+.nano-line-empty {
+  color: transparent;
+}
+
+.nano-cursor {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0.62rem;
+  height: 1.16em;
+  background: #dff0ff;
+  color: #041425;
+  animation: terminal-cursor-blink 1s steps(1, end) infinite;
+}
+
+.nano-cursor-prompt {
+  margin-inline: 0.08rem;
+}
+
+.nano-input-proxy {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.nano-input-proxy:focus {
   outline: none;
 }
 
-.nano-actions {
+.nano-statusbar {
   display: flex;
-  gap: 0.6rem;
-  padding: 0.48rem 0.6rem 0.7rem;
+  justify-content: space-between;
+  gap: 0.8rem;
+  padding: 0.22rem 0.5rem;
+  background: #7ab4e4;
+  color: #05213c;
+  font-size: 0.76rem;
+  font-weight: 600;
 }
 
-.nano-actions button {
-  border: 1px solid #304355;
-  border-radius: 0.4rem;
-  background: #0d1a25;
-  color: #d5e5f3;
-  padding: 0.25rem 0.65rem;
-  font: inherit;
-  cursor: pointer;
+.nano-prompt-line {
+  padding: 0.2rem 0.5rem;
+  background: #0e2638;
+  border-top: 1px solid #24435b;
+  border-bottom: 1px solid #24435b;
+  color: #f6fbff;
+  font-size: 0.76rem;
+  min-height: 1.7rem;
+  display: flex;
+  align-items: center;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
-.nano-actions button:hover {
-  background: #132434;
+.nano-shortcuts {
+  background: #d8ecff;
+  color: #112844;
+  border-top: 1px solid #7ea8cf;
+  padding: 0.15rem 0.42rem 0.32rem;
+}
+
+.nano-shortcut-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.32rem 0.9rem;
+  font-size: 0.72rem;
+  margin-top: 0.1rem;
+}
+
+.nano-shortcut {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.18rem;
+}
+
+.nano-shortcut-key {
+  color: #0a4f86;
+  font-weight: 700;
 }
 
 @media (max-width: 780px) {
@@ -335,7 +404,13 @@
     gap: 0.35rem;
   }
 
-  .nano-actions {
-    justify-content: flex-end;
+  .nano-shortcut-row {
+    gap: 0.28rem 0.55rem;
+  }
+
+  .nano-statusbar {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0;
   }
 }

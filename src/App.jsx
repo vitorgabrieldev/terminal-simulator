@@ -722,12 +722,51 @@ function nanoGoto(session, rawValue) {
   )
 }
 
-function createPrompt(type, label, initialValue = '') {
+function nanoReplaceAll(session, findValue, replaceValue) {
+  if (!findValue) {
+    return {
+      ...session,
+      prompt: null,
+      statusMessage: '[ Replace cancelled ]',
+    }
+  }
+
+  let replacementCount = 0
+  const lines = session.lines.map((line) => {
+    const fragments = line.split(findValue)
+    if (fragments.length <= 1) return line
+    replacementCount += fragments.length - 1
+    return fragments.join(replaceValue)
+  })
+
+  if (replacementCount === 0) {
+    return {
+      ...session,
+      prompt: null,
+      statusMessage: `[ "${findValue}" not found ]`,
+    }
+  }
+
+  const cursorCol = Math.min(session.cursorCol, lines[session.cursorRow].length)
+  return ensureNanoViewport({
+    ...session,
+    lines,
+    cursorCol,
+    preferredCol: cursorCol,
+    prompt: null,
+    dirty: true,
+    lastAction: 'insert',
+    statusMessage: `[ Replaced ${replacementCount} occurrence${replacementCount === 1 ? '' : 's'} ]`,
+  })
+}
+
+function createPrompt(type, label, initialValue = '', extra = {}) {
   return {
     type,
     label,
     value: initialValue,
     cursor: initialValue.length,
+    ...extra,
   }
 }
 
@@ -1451,6 +1490,71 @@ function App() {
       }
       if (nanoSession.prompt.type === 'goto') {
         withNanoSession((previous) => nanoGoto(previous, previous.prompt.value))
+        return
+      }
+      if (nanoSession.prompt.type === 'read-file') {
+        const requestedPath = nanoSession.prompt.value.trim()
+        if (!requestedPath) {
+          withNanoSession((previous) => ({
+            ...previous,
+            prompt: null,
+            statusMessage: '[ Read cancelled ]',
+          }))
+          return
+        }
+
+        const targetPath = normalizePath(requestedPath, currentPath)
+        const node = getNodeAtPath(fileSystem, targetPath)
+
+        if (!node) {
+          withNanoSession((previous) => ({
+            ...previous,
+            prompt: null,
+            statusMessage: `read: ${requestedPath}: No such file`,
+          }))
+          return
+        }
+
+        if (node.type !== 'file') {
+          withNanoSession((previous) => ({
+            ...previous,
+            prompt: null,
+            statusMessage: `read: ${requestedPath}: Is a directory`,
+          }))
+          return
+        }
+
+        withNanoSession((previous) => ({
+          ...nanoInsertText(
+            {
+              ...previous,
+              prompt: null,
+            },
+            node.content
+          ),
+          statusMessage: `[ Read ${node.content.length} chars from ${targetPath} ]`,
+        }))
+        return
+      }
+      if (nanoSession.prompt.type === 'replace-find') {
+        const findValue = nanoSession.prompt.value
+        withNanoSession((previous) => ({
+          ...previous,
+          prompt: createPrompt(
+            'replace-with',
+            `Replace "${findValue}" with`,
+            '',
+            { findValue }
+          ),
+        }))
+        return
+      }
+      if (nanoSession.prompt.type === 'replace-with') {
+        const findValue = nanoSession.prompt.findValue || ''
+        const replaceValue = nanoSession.prompt.value
+        withNanoSession((previous) =>
+          nanoReplaceAll(previous, findValue, replaceValue)
+        )
       }
       return
     }
@@ -1618,7 +1722,7 @@ function App() {
       event.preventDefault()
       withNanoSession((previous) => ({
         ...previous,
-        statusMessage: '[ Read File is not implemented in this simulator ]',
+        prompt: createPrompt('read-file', 'Read File', ''),
       }))
       return
     }
@@ -1627,7 +1731,11 @@ function App() {
       event.preventDefault()
       withNanoSession((previous) => ({
         ...previous,
-        statusMessage: '[ Replace is not implemented in this simulator ]',
+        prompt: createPrompt(
+          'replace-find',
+          'Search',
+          previous.lastSearch || ''
+        ),
       }))
       return
     }
@@ -1833,3 +1941,193 @@ function App() {
   const nanoPromptAfter = nanoPromptHasCharacter
     ? nanoPromptValue.slice(nanoPromptCursor + 1)
     : ''
+  return (
+    <div className="desktop">
+      <main className="terminal-shell">
+        <header className="terminal-header">
+          <div className="window-controls" aria-hidden="true">
+            <span className="dot dot-close" />
+            <span className="dot dot-min" />
+            <span className="dot dot-max" />
+          </div>
+          <p className="terminal-title">
+            {USERNAME}@{HOSTNAME}: {formatPromptPath(currentPath)}
+          </p>
+          <p className="terminal-tab">bash</p>
+        </header>
+
+        <section
+          className="terminal-body"
+          aria-label="Linux terminal"
+          onClick={handleFocus}
+          ref={bodyRef}
+        >
+          {history.map((entry, index) => {
+            if (entry.type === 'command') {
+              return (
+                <p className="line line-command" key={`command-${index}`}>
+                  <span className="prompt-user">
+                    {USERNAME}@{HOSTNAME}
+                  </span>
+                  <span className="prompt-path">:{formatPromptPath(entry.path)}</span>
+                  <span className="prompt-symbol">$</span>
+                  <span className="prompt-text">{entry.text || '\u00a0'}</span>
+                </p>
+              )
+            }
+
+            return (
+              <p className={`line line-${entry.type}`} key={`${entry.type}-${index}`}>
+                {entry.text}
+              </p>
+            )
+          })}
+
+          {nanoSession ? (
+            <div className="nano-editor" onClick={() => nanoInputRef.current?.focus()}>
+              <div className="nano-topbar">
+                <span>GNU nano 8.0</span>
+                <span className="nano-topbar-file">
+                  {nanoSession.path}
+                  {nanoSession.dirty ? ' (Modified)' : ''}
+                </span>
+              </div>
+
+              <div className="nano-buffer">
+                {nanoVisibleLines.map((line, lineIndex) => {
+                  const absoluteRow = nanoSession.viewportTop + lineIndex
+                  const isCursorRow = absoluteRow === nanoSession.cursorRow
+
+                  if (!isCursorRow) {
+                    return (
+                      <div
+                        className="nano-line"
+                        key={`line-${absoluteRow}`}
+                        onMouseDown={(event) => handleNanoBufferClick(event, lineIndex)}
+                      >
+                        {line || '\u00a0'}
+                      </div>
+                    )
+                  }
+
+                  const before = line.slice(0, nanoSession.cursorCol)
+                  const hasChar = nanoSession.cursorCol < line.length
+                  const char = hasChar ? line[nanoSession.cursorCol] : '\u00a0'
+                  const after = hasChar ? line.slice(nanoSession.cursorCol + 1) : ''
+
+                  return (
+                    <div
+                      className="nano-line nano-line-active"
+                      key={`line-${absoluteRow}`}
+                      onMouseDown={(event) => handleNanoBufferClick(event, lineIndex)}
+                    >
+                      <span>{before}</span>
+                      <span className="nano-cursor" aria-hidden="true">
+                        {char === ' ' ? '\u00a0' : char}
+                      </span>
+                      <span>{after}</span>
+                    </div>
+                  )
+                })}
+
+                {Array.from({ length: nanoFillerCount }).map((_, fillerIndex) => (
+                  <div className="nano-line nano-line-empty" key={`filler-${fillerIndex}`}>
+                    {'\u00a0'}
+                  </div>
+                ))}
+
+                <input
+                  autoCapitalize="off"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  className="nano-input-proxy"
+                  onChange={() => {}}
+                  onKeyDown={handleNanoKeyDown}
+                  ref={nanoInputRef}
+                  spellCheck={false}
+                  type="text"
+                  value=""
+                />
+              </div>
+
+              <div className="nano-statusbar">
+                <span>{nanoSession.statusMessage || '\u00a0'}</span>
+                <span>{formatNanoPosition(nanoSession)}</span>
+              </div>
+
+              {nanoPrompt ? (
+                <div className="nano-prompt-line">
+                  {nanoPrompt.type === 'confirm-exit' ? (
+                    <span>{nanoPrompt.label} (Y/N/C)</span>
+                  ) : (
+                    <>
+                      <span>{nanoPrompt.label}: </span>
+                      <span>{nanoPromptBefore}</span>
+                      <span className="nano-cursor nano-cursor-prompt" aria-hidden="true">
+                        {nanoPromptCharacter === ' ' ? '\u00a0' : nanoPromptCharacter}
+                      </span>
+                      <span>{nanoPromptAfter}</span>
+                    </>
+                  )}
+                </div>
+              ) : null}
+
+              <div className="nano-shortcuts">
+                {NANO_SHORTCUT_ROWS.map((shortcutRow, rowIndex) => (
+                  <div className="nano-shortcut-row" key={`shortcut-row-${rowIndex}`}>
+                    {shortcutRow.map((shortcut) => {
+                      const [shortcutKey, ...rest] = shortcut.split(' ')
+                      return (
+                        <span className="nano-shortcut" key={`${rowIndex}-${shortcut}`}>
+                          <span className="nano-shortcut-key">{shortcutKey}</span>
+                          <span>{rest.join(' ')}</span>
+                        </span>
+                      )
+                    })}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <form className="line line-command line-input" onSubmit={handleSubmit}>
+              <span className="prompt-user">
+                {USERNAME}@{HOSTNAME}
+              </span>
+              <span className="prompt-path">:{formatPromptPath(currentPath)}</span>
+              <span className="prompt-symbol">$</span>
+              <div
+                className="terminal-editor"
+                onClick={handleCommandEditorClick}
+                role="textbox"
+                tabIndex={-1}
+              >
+                <span className="terminal-editor-text">{beforeCursor}</span>
+                <span className="terminal-cursor" aria-hidden="true">
+                  {cursorGlyph}
+                </span>
+                <span className="terminal-editor-text">{afterCursor}</span>
+                <input
+                  autoCapitalize="off"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  className="terminal-input-proxy"
+                  onChange={() => {}}
+                  onKeyDown={handleCommandKeyDown}
+                  onPaste={handleCommandPasteEvent}
+                  ref={inputRef}
+                  spellCheck={false}
+                  type="text"
+                  value=""
+                />
+              </div>
+            </form>
+          )}
+        </section>
+      </main>
+      <div className="ambient-glow" aria-hidden="true" />
+      <div className="ambient-grid" aria-hidden="true" />
+    </div>
+  )
+}
+
+export default App
