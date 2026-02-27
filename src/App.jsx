@@ -41,6 +41,9 @@ const COMMAND_PATHS = {
   ps: '/bin/ps',
   top: '/usr/bin/top',
   htop: '/usr/bin/htop',
+  jobs: '/bin/jobs',
+  bg: '/bin/bg',
+  fg: '/bin/fg',
   kill: '/bin/kill',
   pkill: '/usr/bin/pkill',
   ping: '/bin/ping',
@@ -603,11 +606,17 @@ function getParentPath(path) {
   return `/${parts.slice(0, -1).join('/')}`
 }
 
+function getUserGroups(user) {
+  if (user === 'root') return ['root']
+  if (user === USERNAME) return [USERNAME, 'adm']
+  return [user]
+}
+
 function getPermissionChunk(node, user) {
   const mode = node.mode || defaultMode('/', node.type)
   if (user === 'root') return 'rwx'
   if (node.owner === user) return mode.slice(1, 4)
-  if (node.group === user) return mode.slice(4, 7)
+  if (getUserGroups(user).includes(node.group)) return mode.slice(4, 7)
   return mode.slice(7, 10)
 }
 
@@ -619,12 +628,39 @@ function hasPermission(node, user, permission) {
   return false
 }
 
+function canTraversePath(root, path, user, includeTarget = false) {
+  if (user === 'root') return true
+  if (!root || root.type !== 'dir') return false
+  if (!hasPermission(root, user, 'x')) return false
+
+  const segments = splitPath(path)
+  const limit = includeTarget ? segments.length : Math.max(segments.length - 1, 0)
+  let current = root
+
+  for (let index = 0; index < limit; index += 1) {
+    const segment = segments[index]
+    const next = current.children[segment]
+    if (!next || next.type !== 'dir') return false
+    if (!hasPermission(next, user, 'x')) return false
+    current = next
+  }
+
+  return true
+}
+
+function checkTraversePermission(root, targetPath, user, command, displayTarget = targetPath) {
+  if (canTraversePath(root, targetPath, user, false)) return null
+  return `${command}: cannot access '${displayTarget}': Permission denied`
+}
+
 function checkParentDirectoryPermission(root, targetPath, user, command) {
   const parentPath = getParentPath(targetPath)
   const parentNode = getNodeAtPath(root, parentPath)
   if (!parentNode || parentNode.type !== 'dir') {
     return `${command}: cannot access '${targetPath}': No such file or directory`
   }
+  const traverseError = checkTraversePermission(root, targetPath, user, command)
+  if (traverseError) return traverseError
   if (!hasPermission(parentNode, user, 'w') || !hasPermission(parentNode, user, 'x')) {
     return `${command}: cannot access '${targetPath}': Permission denied`
   }
@@ -665,6 +701,9 @@ function usageForCommand(command) {
     ps: 'ps',
     top: 'top',
     htop: 'htop',
+    jobs: 'jobs',
+    bg: 'bg [%job]',
+    fg: 'fg [%job]',
     kill: 'kill [-9] pid...',
     pkill: 'pkill pattern',
     ping: 'ping host [-c count]',
@@ -698,6 +737,29 @@ function tokenize(input) {
     }
     return token
   })
+}
+
+function resolveJobFromArg(jobList, rawArg) {
+  if (jobList.length === 0) {
+    return { error: 'no current job' }
+  }
+
+  if (!rawArg) {
+    return { job: jobList[jobList.length - 1] }
+  }
+
+  const cleaned = rawArg.startsWith('%') ? rawArg.slice(1) : rawArg
+  const id = Number(cleaned)
+  if (!Number.isInteger(id)) {
+    return { error: `${rawArg}: no such job` }
+  }
+
+  const job = jobList.find((item) => item.id === id)
+  if (!job) {
+    return { error: `${rawArg}: no such job` }
+  }
+
+  return { job }
 }
 
 function loadFileSystemFromStorage() {
@@ -1405,6 +1467,9 @@ function App() {
   const [installedPackages, setInstalledPackages] = useState(loadInstalledPackagesFromStorage)
   const [processTable, setProcessTable] = useState(createDefaultProcesses)
   const [bootTimestamp] = useState(loadBootTimestamp)
+  const [jobs, setJobs] = useState([])
+  const [nextJobId, setNextJobId] = useState(1)
+  const [nextPid, setNextPid] = useState(2000)
   const [currentPath, setCurrentPath] = useState(HOME_PATH)
   const [history, setHistory] = useState([])
   const [inputValue, setInputValue] = useState('')
@@ -1419,6 +1484,7 @@ function App() {
   const bodyRef = useRef(null)
   const inputValueRef = useRef('')
   const cursorIndexRef = useRef(0)
+  const currentUser = USERNAME
 
   useEffect(() => {
     inputValueRef.current = inputValue
@@ -1497,6 +1563,43 @@ function App() {
     if (!nanoSession) return false
 
     const contentToWrite = nanoContent(nanoSession)
+    const existingNode = getNodeAtPath(fileSystem, nanoSession.path)
+    if (existingNode) {
+      const traverseError = checkTraversePermission(
+        fileSystem,
+        nanoSession.path,
+        currentUser,
+        'nano',
+        nanoSession.path
+      )
+      if (traverseError || !hasPermission(existingNode, currentUser, 'w')) {
+        withNanoSession((previous) => ({
+          ...previous,
+          statusMessage: `nano: ${previous.path}: Permission denied`,
+          prompt: null,
+        }))
+        return false
+      }
+    } else {
+      const parentError = checkParentDirectoryPermission(
+        fileSystem,
+        nanoSession.path,
+        currentUser,
+        'nano'
+      )
+      if (parentError) {
+        const statusMessage = parentError.includes('No such file or directory')
+          ? `nano: ${nanoSession.path}: No such file or directory`
+          : `nano: ${nanoSession.path}: Permission denied`
+        withNanoSession((previous) => ({
+          ...previous,
+          statusMessage,
+          prompt: null,
+        }))
+        return false
+      }
+    }
+
     const saveResult = writeFileAtPath(fileSystem, nanoSession.path, contentToWrite)
     if (saveResult.error) {
       withNanoSession((previous) => ({
@@ -1542,7 +1645,12 @@ function App() {
     setNanoSession(null)
   }
   const executeCommand = (rawInput, executionPath, executionFileSystem) => {
-    const commandParts = tokenize(rawInput.trim())
+    const trimmedInput = rawInput.trim()
+    const runInBackground = /(?:^|\s)&\s*$/.test(trimmedInput)
+    const normalizedInput = runInBackground
+      ? trimmedInput.replace(/\s*&\s*$/, '').trim()
+      : trimmedInput
+    const commandParts = tokenize(normalizedInput)
     const result = {
       lines: [],
       nextPath: null,
@@ -1550,6 +1658,9 @@ function App() {
       nextNanoSession: undefined,
       nextPackages: null,
       nextProcesses: null,
+      nextJobs: null,
+      nextJobId: null,
+      nextPid: null,
       clearHistory: false,
     }
 
@@ -1571,6 +1682,54 @@ function App() {
       const usage = usageForCommand(command)
       if (usage) {
         result.lines.push({ type: 'output', text: `Usage: ${usage}` })
+        return result
+      }
+    }
+
+    const backgroundBlockedCommands = new Set([
+      'nano',
+      'cd',
+      'pwd',
+      'help',
+      'clear',
+      'jobs',
+      'bg',
+      'fg',
+    ])
+    if (runInBackground) {
+      if (backgroundBlockedCommands.has(command)) {
+        result.lines.push({
+          type: 'error',
+          text: `${command}: cannot run this command in background`,
+        })
+        return result
+      }
+
+      if (usageForCommand(command)) {
+        const backgroundJob = {
+          id: nextJobId,
+          pid: nextPid,
+          command: normalizedInput,
+          status: 'Running',
+          createdAt: new Date().toISOString(),
+        }
+        const backgroundProc = {
+          pid: nextPid,
+          user: currentUser,
+          cpu: '0.0',
+          mem: '0.1',
+          tty: 'pts/0',
+          time: '00:00:00',
+          cmd: normalizedInput,
+        }
+        result.nextJobs = [...jobs, backgroundJob]
+        result.nextJobId = nextJobId + 1
+        result.nextPid = nextPid + 1
+        result.nextProcesses = [...processTable, backgroundProc]
+        result.lines.push({
+          type: 'output',
+          text: `[${backgroundJob.id}] ${backgroundJob.pid}`,
+        })
         return result
       }
     }
@@ -1620,7 +1779,26 @@ function App() {
         return result
       }
 
+      const traverseError = checkTraversePermission(
+        executionFileSystem,
+        targetPath,
+        currentUser,
+        'ls',
+        pathArg || '.'
+      )
+      if (traverseError) {
+        result.lines.push({ type: 'error', text: traverseError })
+        return result
+      }
+
       if (node.type === 'file') {
+        if (!hasPermission(node, currentUser, 'r')) {
+          result.lines.push({
+            type: 'error',
+            text: `ls: cannot access '${pathArg || '.'}': Permission denied`,
+          })
+          return result
+        }
         const normalizedNode = ensureNodeMetadata(node, targetPath)
         if (longFormat) {
           const line = `${normalizedNode.mode} 1 ${normalizedNode.owner} ${normalizedNode.group} ${normalizedNode.content.length
@@ -1633,6 +1811,14 @@ function App() {
             text: getBaseName(targetPath),
           })
         }
+        return result
+      }
+
+      if (!hasPermission(node, currentUser, 'r') || !hasPermission(node, currentUser, 'x')) {
+        result.lines.push({
+          type: 'error',
+          text: `ls: cannot open directory '${pathArg || '.'}': Permission denied`,
+        })
         return result
       }
 
@@ -1715,6 +1901,14 @@ function App() {
         return result
       }
 
+      if (!canTraversePath(executionFileSystem, targetPath, currentUser, true)) {
+        result.lines.push({
+          type: 'error',
+          text: `cd: ${args[0] || '~'}: Permission denied`,
+        })
+        return result
+      }
+
       result.nextPath = targetPath
       return result
     }
@@ -1729,6 +1923,34 @@ function App() {
       let changed = false
       for (const arg of args) {
         const targetPath = normalizePath(arg, executionPath)
+        const existingNode = getNodeAtPath(workingFileSystem, targetPath)
+        if (existingNode) {
+          const traverseError = checkTraversePermission(
+            workingFileSystem,
+            targetPath,
+            currentUser,
+            'touch'
+          )
+          if (traverseError || !hasPermission(existingNode, currentUser, 'w')) {
+            result.lines.push({
+              type: 'error',
+              text: `touch: cannot touch '${arg}': Permission denied`,
+            })
+            continue
+          }
+        } else {
+          const parentError = checkParentDirectoryPermission(
+            workingFileSystem,
+            targetPath,
+            currentUser,
+            'touch'
+          )
+          if (parentError) {
+            result.lines.push({ type: 'error', text: parentError })
+            continue
+          }
+        }
+
         const touchResult = touchPath(workingFileSystem, targetPath)
         if (touchResult.error) {
           result.lines.push({ type: 'error', text: touchResult.error })
@@ -1753,6 +1975,16 @@ function App() {
       let changed = false
       for (const arg of args) {
         const targetPath = normalizePath(arg, executionPath)
+        const parentError = checkParentDirectoryPermission(
+          workingFileSystem,
+          targetPath,
+          currentUser,
+          'rmdir'
+        )
+        if (parentError) {
+          result.lines.push({ type: 'error', text: parentError })
+          continue
+        }
         const removeResult = removeDirectoryPath(workingFileSystem, targetPath)
         if (removeResult.error) {
           result.lines.push({ type: 'error', text: removeResult.error })
@@ -1789,6 +2021,16 @@ function App() {
       let changed = false
       for (const target of targets) {
         const targetPath = normalizePath(target, executionPath)
+        const parentError = checkParentDirectoryPermission(
+          workingFileSystem,
+          targetPath,
+          currentUser,
+          'rm'
+        )
+        if (parentError) {
+          result.lines.push({ type: 'error', text: parentError })
+          continue
+        }
         const removeResult = removePath(workingFileSystem, targetPath, recursive)
         if (removeResult.error) {
           result.lines.push({ type: 'error', text: removeResult.error })
@@ -1820,6 +2062,61 @@ function App() {
       }
       const sourcePath = normalizePath(values[0], executionPath)
       const destinationPath = normalizePath(values[1], executionPath)
+      const sourceNode = getNodeAtPath(executionFileSystem, sourcePath)
+      if (sourceNode) {
+        const traverseError = checkTraversePermission(
+          executionFileSystem,
+          sourcePath,
+          currentUser,
+          'cp',
+          values[0]
+        )
+        if (traverseError) {
+          result.lines.push({ type: 'error', text: traverseError })
+          return result
+        }
+        if (!hasPermission(sourceNode, currentUser, 'r')) {
+          result.lines.push({
+            type: 'error',
+            text: `cp: cannot open '${values[0]}' for reading: Permission denied`,
+          })
+          return result
+        }
+        if (sourceNode.type === 'dir' && !hasPermission(sourceNode, currentUser, 'x')) {
+          result.lines.push({
+            type: 'error',
+            text: `cp: cannot access '${values[0]}': Permission denied`,
+          })
+          return result
+        }
+      }
+      const finalDestinationPath = resolveCopyTargetPath(
+        executionFileSystem,
+        sourcePath,
+        destinationPath
+      )
+      const parentError = checkParentDirectoryPermission(
+        executionFileSystem,
+        finalDestinationPath,
+        currentUser,
+        'cp'
+      )
+      if (parentError) {
+        result.lines.push({ type: 'error', text: parentError })
+        return result
+      }
+      const destinationNode = getNodeAtPath(executionFileSystem, finalDestinationPath)
+      if (
+        destinationNode &&
+        destinationNode.type === 'file' &&
+        !hasPermission(destinationNode, currentUser, 'w')
+      ) {
+        result.lines.push({
+          type: 'error',
+          text: `cp: cannot create regular file '${values[1]}': Permission denied`,
+        })
+        return result
+      }
       const copyResult = copyPath(
         executionFileSystem,
         sourcePath,
@@ -1844,6 +2141,57 @@ function App() {
       }
       const sourcePath = normalizePath(args[0], executionPath)
       const destinationPath = normalizePath(args[1], executionPath)
+      const sourceNode = getNodeAtPath(executionFileSystem, sourcePath)
+      if (sourceNode) {
+        const traverseError = checkTraversePermission(
+          executionFileSystem,
+          sourcePath,
+          currentUser,
+          'mv',
+          args[0]
+        )
+        if (traverseError) {
+          result.lines.push({ type: 'error', text: traverseError })
+          return result
+        }
+      }
+      const sourceParentError = checkParentDirectoryPermission(
+        executionFileSystem,
+        sourcePath,
+        currentUser,
+        'mv'
+      )
+      if (sourceParentError) {
+        result.lines.push({ type: 'error', text: sourceParentError })
+        return result
+      }
+      const realDestinationPath = resolveCopyTargetPath(
+        executionFileSystem,
+        sourcePath,
+        destinationPath
+      )
+      const destinationParentError = checkParentDirectoryPermission(
+        executionFileSystem,
+        realDestinationPath,
+        currentUser,
+        'mv'
+      )
+      if (destinationParentError) {
+        result.lines.push({ type: 'error', text: destinationParentError })
+        return result
+      }
+      const destinationNode = getNodeAtPath(executionFileSystem, realDestinationPath)
+      if (
+        destinationNode &&
+        destinationNode.type === 'file' &&
+        !hasPermission(destinationNode, currentUser, 'w')
+      ) {
+        result.lines.push({
+          type: 'error',
+          text: `mv: cannot move '${args[0]}' to '${args[1]}': Permission denied`,
+        })
+        return result
+      }
       const moveResult = movePath(executionFileSystem, sourcePath, destinationPath)
       if (moveResult.error) {
         result.lines.push({ type: 'error', text: moveResult.error })
@@ -1865,6 +2213,17 @@ function App() {
         const node = getNodeAtPath(executionFileSystem, targetPath)
         if (!node) {
           rows.push(`stat: cannot stat '${arg}': No such file or directory`)
+          continue
+        }
+        const traverseError = checkTraversePermission(
+          executionFileSystem,
+          targetPath,
+          currentUser,
+          'stat',
+          arg
+        )
+        if (traverseError) {
+          rows.push(`stat: cannot stat '${arg}': Permission denied`)
           continue
         }
         const meta = ensureNodeMetadata(node, targetPath)
@@ -1909,6 +2268,21 @@ function App() {
           result.lines.push({
             type: 'error',
             text: `cat: ${arg}: Is a directory`,
+          })
+          continue
+        }
+
+        const traverseError = checkTraversePermission(
+          executionFileSystem,
+          targetPath,
+          currentUser,
+          'cat',
+          arg
+        )
+        if (traverseError || !hasPermission(node, currentUser, 'r')) {
+          result.lines.push({
+            type: 'error',
+            text: `cat: ${arg}: Permission denied`,
           })
           continue
         }
@@ -1976,6 +2350,17 @@ function App() {
           outputs.push(`${command}: error reading '${entry}': Is a directory`)
           continue
         }
+        const traverseError = checkTraversePermission(
+          executionFileSystem,
+          targetPath,
+          currentUser,
+          command,
+          entry
+        )
+        if (traverseError || !hasPermission(node, currentUser, 'r')) {
+          outputs.push(`${command}: cannot open '${entry}' for reading: Permission denied`)
+          continue
+        }
 
         const lines = node.content.split('\n')
         const selected =
@@ -2014,6 +2399,20 @@ function App() {
         })
         return result
       }
+      const traverseError = checkTraversePermission(
+        executionFileSystem,
+        targetPath,
+        currentUser,
+        command,
+        args[0]
+      )
+      if (traverseError || !hasPermission(node, currentUser, 'r')) {
+        result.lines.push({
+          type: 'error',
+          text: `${command}: ${args[0]}: Permission denied`,
+        })
+        return result
+      }
       const lines = node.content.split('\n')
       const pageSize = 20
       const pages = []
@@ -2040,6 +2439,16 @@ function App() {
 
       for (const arg of args) {
         const targetPath = normalizePath(arg, executionPath)
+        const parentError = checkParentDirectoryPermission(
+          workingFileSystem,
+          targetPath,
+          currentUser,
+          'mkdir'
+        )
+        if (parentError) {
+          result.lines.push({ type: 'error', text: parentError })
+          continue
+        }
         const mkdirResult = createDirectoryAtPath(workingFileSystem, targetPath)
 
         if (mkdirResult.error) {
@@ -2066,6 +2475,30 @@ function App() {
         result.lines.push({
           type: 'error',
           text: `find: '${startArg}': No such file or directory`,
+        })
+        return result
+      }
+      const traverseError = checkTraversePermission(
+        executionFileSystem,
+        rootPath,
+        currentUser,
+        'find',
+        startArg
+      )
+      if (traverseError) {
+        result.lines.push({
+          type: 'error',
+          text: `find: '${startArg}': Permission denied`,
+        })
+        return result
+      }
+      if (
+        rootNode.type === 'dir' &&
+        (!hasPermission(rootNode, currentUser, 'r') || !hasPermission(rootNode, currentUser, 'x'))
+      ) {
+        result.lines.push({
+          type: 'error',
+          text: `find: '${startArg}': Permission denied`,
         })
         return result
       }
@@ -2157,7 +2590,22 @@ function App() {
           outputs.push(`grep: ${target}: No such file or directory`)
           continue
         }
+        const traverseError = checkTraversePermission(
+          executionFileSystem,
+          targetPath,
+          currentUser,
+          'grep',
+          target
+        )
+        if (traverseError) {
+          outputs.push(`grep: ${target}: Permission denied`)
+          continue
+        }
         if (node.type === 'file') {
+          if (!hasPermission(node, currentUser, 'r')) {
+            outputs.push(`grep: ${target}: Permission denied`)
+            continue
+          }
           scanFile(targetPath, node)
           continue
         }
@@ -2165,9 +2613,19 @@ function App() {
           outputs.push(`grep: ${target}: Is a directory`)
           continue
         }
+        if (!hasPermission(node, currentUser, 'r') || !hasPermission(node, currentUser, 'x')) {
+          outputs.push(`grep: ${target}: Permission denied`)
+          continue
+        }
 
         walkFileSystem(node, targetPath, (walkNode, walkPath) => {
           if (walkNode.type === 'file') {
+            if (!canTraversePath(executionFileSystem, walkPath, currentUser, false)) {
+              return
+            }
+            if (!hasPermission(walkNode, currentUser, 'r')) {
+              return
+            }
             scanFile(walkPath, walkNode)
           }
         })
@@ -2232,6 +2690,40 @@ function App() {
         return result
       }
 
+      if (existingNode) {
+        const traverseError = checkTraversePermission(
+          executionFileSystem,
+          targetPath,
+          currentUser,
+          'nano',
+          args[0]
+        )
+        if (traverseError || !hasPermission(existingNode, currentUser, 'r')) {
+          result.lines.push({
+            type: 'error',
+            text: `nano: ${args[0]}: Permission denied`,
+          })
+          return result
+        }
+      } else {
+        const parentError = checkParentDirectoryPermission(
+          executionFileSystem,
+          targetPath,
+          currentUser,
+          'nano'
+        )
+        if (parentError) {
+          const message = parentError.includes('No such file or directory')
+            ? `nano: ${args[0]}: No such file or directory`
+            : `nano: ${args[0]}: Permission denied`
+          result.lines.push({
+            type: 'error',
+            text: message,
+          })
+          return result
+        }
+      }
+
       result.nextNanoSession = createNanoSession(
         targetPath,
         existingNode ? existingNode.content : ''
@@ -2261,6 +2753,24 @@ function App() {
 
       for (const rawTarget of args.slice(1)) {
         const targetPath = normalizePath(rawTarget, executionPath)
+        const targetNode = getNodeAtPath(workingFileSystem, targetPath)
+        if (targetNode) {
+          const traverseError = checkTraversePermission(
+            workingFileSystem,
+            targetPath,
+            currentUser,
+            'chmod',
+            rawTarget
+          )
+          const targetMeta = ensureNodeMetadata(targetNode, targetPath)
+          if (traverseError || (currentUser !== 'root' && targetMeta.owner !== currentUser)) {
+            result.lines.push({
+              type: 'error',
+              text: `chmod: changing permissions of '${rawTarget}': Operation not permitted`,
+            })
+            continue
+          }
+        }
         const chmodResult = mutateNodeAtPath(
           workingFileSystem,
           targetPath,
@@ -2301,11 +2811,29 @@ function App() {
       }
       const ownerValue = args[0]
       const [owner, group] = ownerValue.split(':')
+      if (currentUser !== 'root') {
+        result.lines.push({
+          type: 'error',
+          text: "chown: changing ownership is only permitted for root",
+        })
+        return result
+      }
       let workingFileSystem = executionFileSystem
       let changed = false
 
       for (const rawTarget of args.slice(1)) {
         const targetPath = normalizePath(rawTarget, executionPath)
+        const traverseError = checkTraversePermission(
+          workingFileSystem,
+          targetPath,
+          currentUser,
+          'chown',
+          rawTarget
+        )
+        if (traverseError) {
+          result.lines.push({ type: 'error', text: traverseError })
+          continue
+        }
         const chownResult = mutateNodeAtPath(
           workingFileSystem,
           targetPath,
@@ -2348,6 +2876,24 @@ function App() {
 
       for (const rawTarget of args.slice(1)) {
         const targetPath = normalizePath(rawTarget, executionPath)
+        const targetNode = getNodeAtPath(workingFileSystem, targetPath)
+        if (targetNode) {
+          const traverseError = checkTraversePermission(
+            workingFileSystem,
+            targetPath,
+            currentUser,
+            'chgrp',
+            rawTarget
+          )
+          const targetMeta = ensureNodeMetadata(targetNode, targetPath)
+          if (traverseError || (currentUser !== 'root' && targetMeta.owner !== currentUser)) {
+            result.lines.push({
+              type: 'error',
+              text: `chgrp: changing group of '${rawTarget}': Operation not permitted`,
+            })
+            continue
+          }
+        }
         const chgrpResult = mutateNodeAtPath(
           workingFileSystem,
           targetPath,
@@ -2381,6 +2927,13 @@ function App() {
       }
 
       const sub = args[0]
+      if (sub !== 'search' && currentUser !== 'root') {
+        result.lines.push({
+          type: 'error',
+          text: "apt: permission denied (are you root?)",
+        })
+        return result
+      }
       if (sub === 'update') {
         result.lines.push({
           type: 'output',
@@ -2514,6 +3067,65 @@ function App() {
       return result
     }
 
+    if (command === 'jobs') {
+      if (jobs.length === 0) {
+        result.lines.push({ type: 'output', text: '' })
+        return result
+      }
+      const lines = jobs.map((job, index) => {
+        const marker = index === jobs.length - 1 ? '+' : '-'
+        return `[${job.id}]${marker}  ${job.status.padEnd(7, ' ')} ${job.command}`
+      })
+      result.lines.push({ type: 'output', text: lines.join('\n') })
+      return result
+    }
+
+    if (command === 'bg') {
+      const resolved = resolveJobFromArg(jobs, args[0])
+      if (resolved.error || !resolved.job) {
+        result.lines.push({ type: 'error', text: `bg: ${resolved.error || 'invalid job'}` })
+        return result
+      }
+
+      const selected = resolved.job
+      const nextJobs = jobs.map((job) =>
+        job.id === selected.id ? { ...job, status: 'Running' } : job
+      )
+      result.nextJobs = nextJobs
+      result.lines.push({ type: 'output', text: `[${selected.id}] ${selected.command} &` })
+      return result
+    }
+
+    if (command === 'fg') {
+      const resolved = resolveJobFromArg(jobs, args[0])
+      if (resolved.error || !resolved.job) {
+        result.lines.push({ type: 'error', text: `fg: ${resolved.error || 'invalid job'}` })
+        return result
+      }
+
+      const selected = resolved.job
+      const remainingJobs = jobs.filter((job) => job.id !== selected.id)
+      const baseProcesses = processTable.filter((proc) => proc.pid !== selected.pid)
+      const fgResult = executeCommand(
+        selected.command,
+        executionPath,
+        executionFileSystem
+      )
+
+      result.nextJobs = remainingJobs
+      result.nextProcesses = fgResult.nextProcesses ?? baseProcesses
+      result.nextPath = fgResult.nextPath
+      result.nextFileSystem = fgResult.nextFileSystem
+      result.nextNanoSession = fgResult.nextNanoSession
+      result.nextPackages = fgResult.nextPackages
+      result.clearHistory = fgResult.clearHistory
+      result.lines.push({ type: 'output', text: selected.command })
+      if (!fgResult.clearHistory) {
+        result.lines.push(...fgResult.lines)
+      }
+      return result
+    }
+
     if (command === 'kill') {
       if (args.length === 0) {
         result.lines.push({ type: 'error', text: 'kill: usage: kill [-9] pid ...' })
@@ -2525,11 +3137,23 @@ function App() {
         return result
       }
 
-      const nextProcesses = processTable.filter(
-        (proc) => !ids.includes(proc.pid) || proc.pid === 1
+      const targetProcesses = processTable.filter((proc) => ids.includes(proc.pid))
+      const forbidden = targetProcesses.filter(
+        (proc) => proc.pid !== 1 && currentUser !== 'root' && proc.user !== currentUser
       )
+      if (forbidden.length > 0) {
+        result.lines.push({
+          type: 'error',
+          text: `kill: (${forbidden[0].pid}) - Operation not permitted`,
+        })
+        return result
+      }
+
+      const killableIds = ids.filter((pid) => pid !== 1)
+      const nextProcesses = processTable.filter((proc) => !killableIds.includes(proc.pid))
+      const nextJobs = jobs.filter((job) => !killableIds.includes(job.pid))
       result.nextProcesses = nextProcesses
-      result.lines.push({ type: 'output', text: '' })
+      result.nextJobs = nextJobs
       return result
     }
 
@@ -2539,12 +3163,24 @@ function App() {
         return result
       }
       const pattern = args[0].toLowerCase()
-      const nextProcesses = processTable.filter((proc) => {
-        if (proc.pid === 1) return true
-        return !proc.cmd.toLowerCase().includes(pattern)
-      })
+      const matching = processTable.filter(
+        (proc) => proc.pid !== 1 && proc.cmd.toLowerCase().includes(pattern)
+      )
+      const forbidden = matching.filter(
+        (proc) => currentUser !== 'root' && proc.user !== currentUser
+      )
+      if (forbidden.length > 0) {
+        result.lines.push({
+          type: 'error',
+          text: `pkill: killing pid ${forbidden[0].pid} failed: Operation not permitted`,
+        })
+        return result
+      }
+      const killableIds = matching.map((proc) => proc.pid)
+      const nextProcesses = processTable.filter((proc) => !killableIds.includes(proc.pid))
+      const nextJobs = jobs.filter((job) => !killableIds.includes(job.pid))
       result.nextProcesses = nextProcesses
-      result.lines.push({ type: 'output', text: '' })
+      result.nextJobs = nextJobs
       return result
     }
 
@@ -2634,6 +3270,31 @@ function App() {
         outputName = args[outputIndex + 1]
       }
       const destinationPath = normalizePath(outputName, executionPath)
+      const existingNode = getNodeAtPath(executionFileSystem, destinationPath)
+      if (existingNode) {
+        const traverseError = checkTraversePermission(
+          executionFileSystem,
+          destinationPath,
+          currentUser,
+          'wget',
+          outputName
+        )
+        if (traverseError || !hasPermission(existingNode, currentUser, 'w')) {
+          result.lines.push({ type: 'error', text: `wget: cannot write '${outputName}': Permission denied` })
+          return result
+        }
+      } else {
+        const parentError = checkParentDirectoryPermission(
+          executionFileSystem,
+          destinationPath,
+          currentUser,
+          'wget'
+        )
+        if (parentError) {
+          result.lines.push({ type: 'error', text: `wget: cannot write '${outputName}': Permission denied` })
+          return result
+        }
+      }
       const content = `Downloaded from ${url}\nDate: ${new Date().toISOString()}\n`
       const writeResult = writeFileAtPath(executionFileSystem, destinationPath, content)
       if (writeResult.error) {
@@ -2671,13 +3332,71 @@ function App() {
             })
             continue
           }
+          const traverseError = checkTraversePermission(
+            executionFileSystem,
+            inputPath,
+            currentUser,
+            'tar',
+            input
+          )
+          if (traverseError || !hasPermission(node, currentUser, 'r')) {
+            result.lines.push({
+              type: 'error',
+              text: `tar: ${input}: Cannot open: Permission denied`,
+            })
+            continue
+          }
+          if (node.type === 'dir' && !hasPermission(node, currentUser, 'x')) {
+            result.lines.push({
+              type: 'error',
+              text: `tar: ${input}: Cannot open: Permission denied`,
+            })
+            continue
+          }
           walkFileSystem(node, inputPath, (walkNode, walkPath) => {
             if (walkNode.type === 'file') {
+              if (!canTraversePath(executionFileSystem, walkPath, currentUser, false)) {
+                return
+              }
+              if (!hasPermission(walkNode, currentUser, 'r')) {
+                return
+              }
               entries.push({ path: walkPath, content: walkNode.content })
             }
           })
           if (node.type === 'dir' && entries.length === 0) {
             entries.push({ path: inputPath, content: '' })
+          }
+        }
+        const archiveExisting = getNodeAtPath(executionFileSystem, archivePath)
+        if (archiveExisting) {
+          const traverseError = checkTraversePermission(
+            executionFileSystem,
+            archivePath,
+            currentUser,
+            'tar',
+            args[1]
+          )
+          if (traverseError || !hasPermission(archiveExisting, currentUser, 'w')) {
+            result.lines.push({
+              type: 'error',
+              text: `tar: ${args[1]}: Cannot write: Permission denied`,
+            })
+            return result
+          }
+        } else {
+          const parentError = checkParentDirectoryPermission(
+            executionFileSystem,
+            archivePath,
+            currentUser,
+            'tar'
+          )
+          if (parentError) {
+            result.lines.push({
+              type: 'error',
+              text: `tar: ${args[1]}: Cannot write: Permission denied`,
+            })
+            return result
           }
         }
         const archiveContent = `TAR_SIM_V1\n${JSON.stringify(entries)}`
@@ -2701,6 +3420,17 @@ function App() {
           result.lines.push({ type: 'error', text: `tar: ${args[1]}: Cannot open` })
           return result
         }
+        const traverseError = checkTraversePermission(
+          executionFileSystem,
+          archivePath,
+          currentUser,
+          'tar',
+          args[1]
+        )
+        if (traverseError || !hasPermission(archiveNode, currentUser, 'r')) {
+          result.lines.push({ type: 'error', text: `tar: ${args[1]}: Cannot open: Permission denied` })
+          return result
+        }
         if (!archiveNode.content.startsWith('TAR_SIM_V1\n')) {
           result.lines.push({ type: 'error', text: 'tar: This does not look like a tar archive' })
           return result
@@ -2718,6 +3448,17 @@ function App() {
           const relative = entry.path.startsWith('/') ? entry.path.slice(1) : entry.path
           const destinationPath = normalizePath(relative, executionPath)
           const parentPath = destinationPath.split('/').slice(0, -1).join('/') || '/'
+          const parentError = checkParentDirectoryPermission(
+            workingFileSystem,
+            destinationPath,
+            currentUser,
+            'tar'
+          )
+          if (parentError) continue
+          const existingNode = getNodeAtPath(workingFileSystem, destinationPath)
+          if (existingNode && !hasPermission(existingNode, currentUser, 'w')) {
+            continue
+          }
           const ensured = ensureDirectoryPath(workingFileSystem, parentPath)
           if (ensured.error) continue
           const writeResult = writeFileAtPath(ensured.root, destinationPath, entry.content)
@@ -2745,11 +3486,50 @@ function App() {
         result.lines.push({ type: 'error', text: `${command}: ${args[0]}: No such file` })
         return result
       }
+      const traverseError = checkTraversePermission(
+        executionFileSystem,
+        targetPath,
+        currentUser,
+        command,
+        args[0]
+      )
+      if (traverseError || !hasPermission(node, currentUser, 'r')) {
+        result.lines.push({ type: 'error', text: `${command}: ${args[0]}: Permission denied` })
+        return result
+      }
 
       if (command === 'gzip') {
         const encoded = btoa(unescape(encodeURIComponent(node.content)))
         const gzPath = `${targetPath}.gz`
         let workingFileSystem = executionFileSystem
+        const destinationNode = getNodeAtPath(workingFileSystem, gzPath)
+        if (destinationNode) {
+          if (!hasPermission(destinationNode, currentUser, 'w')) {
+            result.lines.push({ type: 'error', text: `gzip: ${args[0]}: Permission denied` })
+            return result
+          }
+        } else {
+          const parentError = checkParentDirectoryPermission(
+            workingFileSystem,
+            gzPath,
+            currentUser,
+            'gzip'
+          )
+          if (parentError) {
+            result.lines.push({ type: 'error', text: `gzip: ${args[0]}: Permission denied` })
+            return result
+          }
+        }
+        const removeParentError = checkParentDirectoryPermission(
+          workingFileSystem,
+          targetPath,
+          currentUser,
+          'gzip'
+        )
+        if (removeParentError) {
+          result.lines.push({ type: 'error', text: `gzip: ${args[0]}: Permission denied` })
+          return result
+        }
         const writeResult = writeFileAtPath(workingFileSystem, gzPath, `GZIP_SIM_V1\n${encoded}`)
         if (writeResult.error) {
           result.lines.push({ type: 'error', text: writeResult.error })
@@ -2772,6 +3552,34 @@ function App() {
       const decoded = decodeURIComponent(escape(atob(node.content.slice('GZIP_SIM_V1\n'.length))))
       const destinationPath = targetPath.slice(0, -3)
       let workingFileSystem = executionFileSystem
+      const destinationNode = getNodeAtPath(workingFileSystem, destinationPath)
+      if (destinationNode) {
+        if (!hasPermission(destinationNode, currentUser, 'w')) {
+          result.lines.push({ type: 'error', text: `gunzip: ${args[0]}: Permission denied` })
+          return result
+        }
+      } else {
+        const parentError = checkParentDirectoryPermission(
+          workingFileSystem,
+          destinationPath,
+          currentUser,
+          'gunzip'
+        )
+        if (parentError) {
+          result.lines.push({ type: 'error', text: `gunzip: ${args[0]}: Permission denied` })
+          return result
+        }
+      }
+      const removeParentError = checkParentDirectoryPermission(
+        workingFileSystem,
+        targetPath,
+        currentUser,
+        'gunzip'
+      )
+      if (removeParentError) {
+        result.lines.push({ type: 'error', text: `gunzip: ${args[0]}: Permission denied` })
+        return result
+      }
       const writeResult = writeFileAtPath(workingFileSystem, destinationPath, decoded)
       if (writeResult.error) {
         result.lines.push({ type: 'error', text: writeResult.error })
@@ -2801,11 +3609,48 @@ function App() {
         const itemPath = normalizePath(item, executionPath)
         const node = getNodeAtPath(executionFileSystem, itemPath)
         if (!node) continue
+        const traverseError = checkTraversePermission(
+          executionFileSystem,
+          itemPath,
+          currentUser,
+          'zip',
+          item
+        )
+        if (traverseError || !hasPermission(node, currentUser, 'r')) {
+          continue
+        }
+        if (node.type === 'dir' && !hasPermission(node, currentUser, 'x')) {
+          continue
+        }
         walkFileSystem(node, itemPath, (walkNode, walkPath) => {
           if (walkNode.type === 'file') {
+            if (!canTraversePath(executionFileSystem, walkPath, currentUser, false)) {
+              return
+            }
+            if (!hasPermission(walkNode, currentUser, 'r')) {
+              return
+            }
             entries.push({ path: walkPath, content: walkNode.content })
           }
         })
+      }
+      const archiveExisting = getNodeAtPath(executionFileSystem, archivePath)
+      if (archiveExisting) {
+        if (!hasPermission(archiveExisting, currentUser, 'w')) {
+          result.lines.push({ type: 'error', text: `zip: cannot write ${args[0]}: Permission denied` })
+          return result
+        }
+      } else {
+        const parentError = checkParentDirectoryPermission(
+          executionFileSystem,
+          archivePath,
+          currentUser,
+          'zip'
+        )
+        if (parentError) {
+          result.lines.push({ type: 'error', text: `zip: cannot write ${args[0]}: Permission denied` })
+          return result
+        }
       }
       const writeResult = writeFileAtPath(
         executionFileSystem,
@@ -2835,6 +3680,17 @@ function App() {
         result.lines.push({ type: 'error', text: `unzip: cannot find ${args[0]}` })
         return result
       }
+      const traverseError = checkTraversePermission(
+        executionFileSystem,
+        archivePath,
+        currentUser,
+        'unzip',
+        args[0]
+      )
+      if (traverseError || !hasPermission(archiveNode, currentUser, 'r')) {
+        result.lines.push({ type: 'error', text: `unzip: cannot open ${args[0]}: Permission denied` })
+        return result
+      }
       if (!archiveNode.content.startsWith('ZIP_SIM_V1\n')) {
         result.lines.push({ type: 'error', text: `unzip:  ${args[0]} is not a zip file` })
         return result
@@ -2852,6 +3708,17 @@ function App() {
         const relative = entry.path.startsWith('/') ? entry.path.slice(1) : entry.path
         const destinationPath = normalizePath(relative, executionPath)
         const parentPath = destinationPath.split('/').slice(0, -1).join('/') || '/'
+        const parentError = checkParentDirectoryPermission(
+          workingFileSystem,
+          destinationPath,
+          currentUser,
+          'unzip'
+        )
+        if (parentError) continue
+        const existingNode = getNodeAtPath(workingFileSystem, destinationPath)
+        if (existingNode && !hasPermission(existingNode, currentUser, 'w')) {
+          continue
+        }
         const ensured = ensureDirectoryPath(workingFileSystem, parentPath)
         if (ensured.error) continue
         const writeResult = writeFileAtPath(ensured.root, destinationPath, entry.content)
@@ -2916,7 +3783,7 @@ function App() {
           'Comandos: ls, cd, pwd, mkdir, rmdir, rm, cp, mv, touch, stat, ' +
           'cat, less, more, head, tail, find, locate, grep, which, whereis, ' +
           'chmod, chown, chgrp, apt, uname, hostname, uptime, date, cal, ' +
-          'ps, top, htop, kill, pkill, ping, ifconfig, ip a, netstat, curl, wget, ' +
+          'ps, top, htop, jobs, bg, fg, kill, pkill, ping, ifconfig, ip a, netstat, curl, wget, ' +
           'tar, gzip, gunzip, zip, unzip, man, info, nano, clear, help',
       })
       return result
@@ -2975,6 +3842,18 @@ function App() {
 
     if (executionResult.nextProcesses) {
       setProcessTable(executionResult.nextProcesses)
+    }
+
+    if (executionResult.nextJobs) {
+      setJobs(executionResult.nextJobs)
+    }
+
+    if (executionResult.nextJobId !== null) {
+      setNextJobId(executionResult.nextJobId)
+    }
+
+    if (executionResult.nextPid !== null) {
+      setNextPid(executionResult.nextPid)
     }
 
     if (executionResult.nextNanoSession !== undefined) {
@@ -3316,6 +4195,22 @@ function App() {
             ...previous,
             prompt: null,
             statusMessage: `read: ${requestedPath}: Is a directory`,
+          }))
+          return
+        }
+
+        const traverseError = checkTraversePermission(
+          fileSystem,
+          targetPath,
+          currentUser,
+          'nano',
+          requestedPath
+        )
+        if (traverseError || !hasPermission(node, currentUser, 'r')) {
+          withNanoSession((previous) => ({
+            ...previous,
+            prompt: null,
+            statusMessage: `read: ${requestedPath}: Permission denied`,
           }))
           return
         }
